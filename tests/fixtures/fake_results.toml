@@ -1,0 +1,71 @@
+# Scripted results for the offline demonstration run.
+#
+# This file replaces the database in milestone 1. It is plain TOML data: no
+# query in the workbook is executed, and no connection is ever opened.
+#
+# Per case you may set, for each of the source/target sides:
+#   <side>_result        the scalar the query "returns" (omit = NULL)
+#   <side>_error         raise a database error with this message instead
+#   <side>_row_count     rows the query "returns" (default 1; anything else
+#                        must be rejected, exactly as a real adapter would)
+#   <side>_column_count  columns the query "returns" (default 1)
+
+version = "1.0"
+
+[defaults]
+# "error" = a case with no entry here is an explicit failure rather than a
+# silent pass. Use "null" to make unscripted cases return NULL instead.
+on_unknown_case = "error"
+
+# PASS — counts agree.
+[[case]]
+test_case_id = "TC-PAY-001"
+source_result = 1500
+target_result = 1500
+
+# PASS — totals differ by 0.01, within the 0.01 tolerance.
+[[case]]
+test_case_id = "TC-PAY-002"
+source_result = 98765.43
+target_result = 98765.44
+
+# PASS — no orphans on either side.
+[[case]]
+test_case_id = "TC-PAY-003"
+source_result = 0
+target_result = 0
+
+# FAIL — three refunds did not migrate.
+[[case]]
+test_case_id = "TC-PAY-004"
+source_result = 4201
+target_result = 4198
+
+# Disabled in the workbook; never executed. Present for completeness.
+[[case]]
+test_case_id = "TC-PAY-005"
+source_result = 0
+target_result = 0
+
+# FAIL — 0.65 exceeds the 0.50 tolerance.
+[[case]]
+test_case_id = "TC-PAY-006"
+source_result = 1000.25
+target_result = 1000.90
+
+# ERROR (source) — the source query fails.
+[[case]]
+test_case_id = "TC-PAY-007"
+source_error = "ORA-00942: table or view does not exist"
+target_result = 8800
+
+# PASS — settlements agree.
+[[case]]
+test_case_id = "TC-PAY-008"
+source_result = 512
+target_result = 512
+
+# ERROR (comparison) — the target returns NULL, which never reconciles.
+[[case]]
+test_case_id = "TC-PAY-009"
+source_result = 100

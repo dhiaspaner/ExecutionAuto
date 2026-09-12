@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Reconciliation outputs — result workbooks may contain client data
+out/
+*_results_*.xlsx
+
+# Real connection configuration must never be committed (examples are tracked)
+config/connections.toml
+config/*.local.toml
+
+# OS noise
+.DS_Store
+Thumbs.db
