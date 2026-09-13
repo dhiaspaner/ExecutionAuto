@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -311,3 +313,55 @@ def test_the_cli_offers_no_password_option() -> None:
         assert command in help_text
     assert "--password" not in help_text
     assert "--pwd" not in help_text
+
+
+def test_execute_survives_a_legacy_console_code_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Windows console code page must never turn a finished run into a traceback.
+
+    Redirected output on Windows is encoded with the active code page, and a
+    legacy one such as cp437 cannot represent every character a message may
+    carry. The report still has to arrive.
+    """
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp437", newline="")
+    stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp437", newline="")
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    code = main(
+        [
+            "execute",
+            str(EXAMPLE_TEMPLATE_PATH),
+            "--schema",
+            str(EXAMPLE_SCHEMA_PATH),
+            "--fake-results",
+            str(EXAMPLE_FIXTURE_PATH),
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+    stdout.flush()
+    out = stdout.buffer.getvalue().decode("cp437")  # type: ignore[attr-defined]
+
+    assert code == EXIT_FAILURES
+    assert "4 passed, 2 failed, 2 errors, 1 skipped" in out
+
+
+def test_run_report_stays_ascii(tmp_path: Path, capsys: Any) -> None:
+    """The framework's own report text is plain ASCII, printable under any code page."""
+    main(
+        [
+            "execute",
+            str(EXAMPLE_TEMPLATE_PATH),
+            "--schema",
+            str(EXAMPLE_SCHEMA_PATH),
+            "--fake-results",
+            str(EXAMPLE_FIXTURE_PATH),
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    (captured.out + captured.err).encode("ascii")

@@ -18,7 +18,8 @@ venv/
 out/
 *_results_*.xlsx
 
-# Real connection configuration must never be committed (examples are tracked)
+# Connection details are prompted for at runtime and belong in no file. These
+# stay as a safety net in case anyone ever creates one locally.
 config/connections.toml
 config/*.local.toml
 

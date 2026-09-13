@@ -18,6 +18,7 @@ accepts a credential. ``--password`` does not exist and must never be added.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -143,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    _make_output_encoding_safe()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -192,7 +194,7 @@ def _cmd_execute(args: argparse.Namespace) -> int:
     book = load_fake_results(args.fake_results)
     factory = create_executor_factory(fake_results=book)
 
-    _emit(f"Offline run — scripted results from {args.fake_results}")
+    _emit(f"Offline run - scripted results from {args.fake_results}")
     options = RunOptions(
         case_ids=tuple(args.cases),
         limit=args.limit,
@@ -232,7 +234,7 @@ def _cmd_make_template(args: argparse.Namespace) -> int:
 
 def _report(summary: RunSummary) -> None:
     _emit("")
-    _emit(f"Run {summary.run_id} — {summary.input_path.name}")
+    _emit(f"Run {summary.run_id} - {summary.input_path.name}")
     _emit("-" * 72)
     for result in summary.results:
         _emit(
@@ -253,6 +255,22 @@ def _report(summary: RunSummary) -> None:
     if not summary.is_clean:
         _emit("")
         _emit("  Review FAIL and ERROR rows above before signing off the migration.")
+
+
+def _make_output_encoding_safe() -> None:
+    """Never let a console code page turn a finished run into a traceback.
+
+    Windows picks the active code page for redirected output, and a legacy one
+    such as cp437 cannot encode every character a message may carry. Degrading
+    a stray character to ``?`` is always better than losing the run report.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover - replaced stream (pytest capture)
+            continue
+        # A detached or closed stream is nothing to fail a run over.
+        with contextlib.suppress(ValueError, OSError):
+            reconfigure(errors="replace")
 
 
 def _emit(message: str) -> None:

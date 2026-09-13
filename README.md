@@ -148,6 +148,8 @@ uv run reconcile execute ".\templates\reconciliation_template.xlsx" `
     --fake-results ".\tests\fixtures\fake_results.toml"
 ```
 
+`--output-dir` must already exist — create it once with `mkdir out`.
+
 ### Output files
 
 Each run writes `<input stem>_results_<yyyymmdd_hhmmss>.xlsx` next to the input,
@@ -259,10 +261,9 @@ reconcile: test-connections is not available in offline mode: no database
 adapter is registered in this milestone.
 ```
 
-`config/connections.example.toml` documents the shape a connection registry will
-take — host, database, driver and authentication **mode** only. It has no
-password key, and will not get one: credentials are prompted for at runtime with
-`getpass` and kept in memory for the life of the run.
+No file in this repository holds connection details, and none will: server,
+database, username and password are asked for at runtime, the password with
+`getpass`, and kept in memory for the life of the run only.
 
 Enabling real connectivity is a separate, reviewed piece of work. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for where the adapters plug in and
@@ -273,7 +274,7 @@ Enabling real connectivity is a separate, reviewed piece of work. See
 ## Repository layout
 
 ```text
-config/     Workbook schema DSL and the connection-registry example
+config/     Workbook schema DSL
 templates/  A generated example workbook matching the example schema
 src/        The framework (see ARCHITECTURE.md)
 tests/      Offline unit tests; tests/integration is an opt-in placeholder
