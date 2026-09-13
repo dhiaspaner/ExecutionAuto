@@ -59,19 +59,21 @@ class ScriptedConsole:
 def sqlserver_answers(**overrides: Any) -> list[str]:
     """A complete, valid set of answers for a SQL Server source."""
     answers = [
-        "WORKBOOK",  # 1  path, replaced by the fixture
-        "2",  # 2  sheet, by number
-        "sqlserver",  # 3  source type
-        "sql-legacy.internal",  # 4  source server
-        "",  # 5  source port, Enter for the default
-        "LegacyDb",  # 6  source database
-        "y",  # 7  trust the source certificate
-        "legacy_reader",  # 8  source username
-        "sql-new.internal",  # 10 target server
-        "1435",  # 11 target port
-        "MigratedDb",  # 12 target database
-        "n",  # 13 trust the target certificate
-        "migrated_reader",  # 14 target username
+        "WORKBOOK",  # path, replaced by the fixture
+        "2",  # sheet, by number
+        "sqlserver",  # source type
+        "sql-legacy.internal",  # source server
+        "",  # source port, Enter for the default
+        "LegacyDb",  # source database
+        "y",  # trust the source certificate
+        "password",  # source authentication
+        "legacy_reader",  # source username
+        "sql-new.internal",  # target server
+        "1435",  # target port
+        "MigratedDb",  # target database
+        "n",  # trust the target certificate
+        "password",  # target authentication
+        "migrated_reader",  # target username
     ]
     for index, value in overrides.items():
         answers[int(index)] = value
@@ -140,15 +142,17 @@ def test_questions_are_asked_in_the_specified_order(workbook: Path, sheets_of: A
     assert "Source port" in asked[4]
     assert "Source database name" in asked[5]
     assert "Trust the source server's certificate" in asked[6]
-    assert "Source username" in asked[7]
-    assert "Target server" in asked[8]
-    assert "Target port" in asked[9]
-    assert "Target database name" in asked[10]
-    assert "Trust the target server's certificate" in asked[11]
-    assert "Target username" in asked[12]
+    assert "Source authentication" in asked[7]
+    assert "Source username" in asked[8]
+    assert "Target server" in asked[9]
+    assert "Target port" in asked[10]
+    assert "Target database name" in asked[11]
+    assert "Trust the target server's certificate" in asked[12]
+    assert "Target authentication" in asked[13]
+    assert "Target username" in asked[14]
     # getpass gets a bare "> "; the labelled question is printed just above it.
     assert len(console.secret_prompts) == 2
-    labels = [line for line in console.printed if "password" in line]
+    labels = [line for line in console.printed if "password (input is hidden)" in line]
     assert "Source password" in labels[0]
     assert "Target password" in labels[1]
 
@@ -168,6 +172,7 @@ def test_an_oracle_source_asks_for_a_service_name_and_skips_the_certificate_ques
         "",
         "MigratedDb",
         "y",
+        "password",
         "migrated_reader",
     ]
     console = ScriptedConsole(answers, [SOURCE_SECRET, TARGET_SECRET])
@@ -181,7 +186,7 @@ def test_an_oracle_source_asks_for_a_service_name_and_skips_the_certificate_ques
     assert result.target.port == 1433
     assert "Source service name" in console.transcript
     assert "Trust the source server's certificate" not in console.transcript
-    assert "[14]" in "".join(console.prompts) or "/14]" in "".join(console.prompts)
+    assert "Source authentication" not in console.transcript
 
 
 # -- validation loops ----------------------------------------------------
@@ -387,3 +392,230 @@ def test_settings_describe_themselves_without_the_password() -> None:
 
     assert SOURCE_SECRET not in settings.describe()
     assert settings.describe() == "sql-01:1433/Db as reader"
+
+
+# -- Windows authentication ----------------------------------------------
+
+
+def windows_answers(workbook: Path, *, source: str = "windows", target: str = "windows") -> list:
+    """Answers where either side may use the signed-in Windows account."""
+    answers = [str(workbook), "2", "sqlserver", "sql-legacy.internal", "", "LegacyDb", "y", source]
+    if source == "password":
+        answers.append("legacy_reader")
+    answers += ["sql-new.internal", "", "MigratedDb", "n", target]
+    if target == "password":
+        answers.append("migrated_reader")
+    return answers
+
+
+def test_windows_authentication_asks_for_no_username_and_no_password(
+    workbook: Path, sheets_of: Any
+) -> None:
+    console = ScriptedConsole(windows_answers(workbook), [])
+
+    result = drive(console, sheets_of)
+
+    assert result.source.uses_windows_authentication is True
+    assert result.target.uses_windows_authentication is True
+    assert result.source.username == ""
+    assert result.source.password == ""
+    assert console.secret_prompts == []
+    assert "Source username" not in console.transcript
+    assert "Target username" not in console.transcript
+
+
+def test_the_two_sides_can_authenticate_differently(workbook: Path, sheets_of: Any) -> None:
+    console = ScriptedConsole(
+        windows_answers(workbook, source="password", target="windows"), [SOURCE_SECRET]
+    )
+
+    result = drive(console, sheets_of)
+
+    assert result.source.uses_windows_authentication is False
+    assert result.source.username == "legacy_reader"
+    assert result.source.password == SOURCE_SECRET
+    assert result.target.uses_windows_authentication is True
+    assert len(console.secret_prompts) == 1
+
+
+def test_an_invalid_authentication_answer_is_re_asked(workbook: Path, sheets_of: Any) -> None:
+    answers = windows_answers(workbook)
+    answers.insert(7, "kerberos")
+    console = ScriptedConsole(answers, [])
+
+    drive(console, sheets_of)
+
+    assert "Answer must be one of: windows, password." in console.transcript
+
+
+def test_windows_authentication_describes_itself_without_a_username(
+    workbook: Path, sheets_of: Any
+) -> None:
+    console = ScriptedConsole(windows_answers(workbook), [])
+
+    result = drive(console, sheets_of)
+
+    assert result.source.describe() == (
+        "sql-legacy.internal:1433/LegacyDb using Windows authentication"
+    )
+
+
+def test_oracle_cannot_use_windows_authentication() -> None:
+    from migration_reconciliation.database.base import QuerySide
+    from migration_reconciliation.database.settings import AuthMode
+
+    with pytest.raises(ReconciliationError, match="SQL Server only"):
+        ConnectionSettings(
+            side=QuerySide.SOURCE,
+            database_type=DatabaseType.ORACLE,
+            server="ora",
+            port=1521,
+            database="SVC",
+            auth_mode=AuthMode.WINDOWS,
+        )
+
+
+def test_password_authentication_requires_both_halves() -> None:
+    from migration_reconciliation.database.base import QuerySide
+
+    with pytest.raises(ReconciliationError, match="needs a username and a password"):
+        ConnectionSettings(
+            side=QuerySide.TARGET,
+            database_type=DatabaseType.SQLSERVER,
+            server="sql",
+            port=1433,
+            database="Db",
+            username="reader",
+            password="",
+        )
+
+
+# -- profiles ------------------------------------------------------------
+
+
+def profile_document(**overrides: Any) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "version": "1.0",
+        "workbook": {"sheet": "Payments"},
+        "source": {
+            "type": "sqlserver",
+            "server": "sql-legacy.internal",
+            "port": 1433,
+            "database": "LegacyDb",
+            "trust_server_certificate": True,
+            "authentication": "password",
+            "username": "legacy_reader",
+        },
+        "target": {
+            "server": "sql-new.internal",
+            "port": 1433,
+            "database": "MigratedDb",
+            "trust_server_certificate": False,
+            "authentication": "windows",
+        },
+    }
+    document.update(overrides)
+    return document
+
+
+def test_a_profile_answers_everything_except_the_password(workbook: Path, sheets_of: Any) -> None:
+    from migration_reconciliation.profile import parse_profile
+
+    document = profile_document()
+    document["workbook"]["path"] = str(workbook)
+    console = ScriptedConsole([], [SOURCE_SECRET])
+
+    result = run_wizard(console.prompter(), profile=parse_profile(document), list_sheets=sheets_of)
+
+    assert console.prompts == []  # nothing was typed except the hidden password
+    assert len(console.secret_prompts) == 1
+    assert result.sheet_name == "Payments"
+    assert result.source.server == "sql-legacy.internal"
+    assert result.source.username == "legacy_reader"
+    assert result.source.password == SOURCE_SECRET
+    assert result.target.uses_windows_authentication is True
+
+
+def test_a_windows_only_profile_asks_nothing_at_all(workbook: Path, sheets_of: Any) -> None:
+    from migration_reconciliation.profile import parse_profile
+
+    document = profile_document()
+    document["workbook"]["path"] = str(workbook)
+    document["source"]["authentication"] = "windows"
+    del document["source"]["username"]
+    console = ScriptedConsole([], [])
+
+    result = run_wizard(console.prompter(), profile=parse_profile(document), list_sheets=sheets_of)
+
+    assert console.prompts == []
+    assert console.secret_prompts == []
+    assert result.source.uses_windows_authentication is True
+
+
+def test_profile_values_are_echoed_rather_than_applied_silently(
+    workbook: Path, sheets_of: Any
+) -> None:
+    from migration_reconciliation.profile import parse_profile
+
+    document = profile_document()
+    document["workbook"]["path"] = str(workbook)
+    console = ScriptedConsole([], [SOURCE_SECRET])
+
+    run_wizard(console.prompter(), profile=parse_profile(document), list_sheets=sheets_of)
+
+    assert "[profile] Source server (hostname or IP): sql-legacy.internal" in console.transcript
+    assert "[profile] Source database name: LegacyDb" in console.transcript
+    assert "[profile] Sheet: Payments" in console.transcript
+
+
+def test_a_partial_profile_still_asks_for_the_rest(workbook: Path, sheets_of: Any) -> None:
+    from migration_reconciliation.profile import parse_profile
+
+    document = {
+        "version": "1.0",
+        "workbook": {"path": str(workbook)},
+        "source": {"type": "sqlserver", "server": "sql-legacy.internal"},
+        "target": {"authentication": "windows"},
+    }
+    console = ScriptedConsole(
+        ["2", "", "LegacyDb", "y", "windows", "sql-new.internal", "", "MigratedDb", "n"],
+        [],
+    )
+
+    result = run_wizard(console.prompter(), profile=parse_profile(document), list_sheets=sheets_of)
+
+    assert result.sheet_name == "Payments"
+    assert result.source.server == "sql-legacy.internal"
+    assert result.source.database == "LegacyDb"
+    assert result.target.database == "MigratedDb"
+
+
+def test_a_profile_pointing_at_a_missing_workbook_falls_back_to_asking(
+    tmp_path: Path, workbook: Path, sheets_of: Any
+) -> None:
+    from migration_reconciliation.profile import parse_profile
+
+    document = profile_document()
+    document["workbook"]["path"] = str(tmp_path / "gone.xlsx")
+    console = ScriptedConsole([str(workbook)], [SOURCE_SECRET])
+
+    result = run_wizard(console.prompter(), profile=parse_profile(document), list_sheets=sheets_of)
+
+    assert result.workbook_path == workbook
+    assert "was not found, so the question is being asked" in console.transcript
+
+
+def test_a_profile_naming_a_sheet_this_workbook_lacks_falls_back_to_asking(
+    workbook: Path, sheets_of: Any
+) -> None:
+    from migration_reconciliation.profile import parse_profile
+
+    document = profile_document()
+    document["workbook"]["path"] = str(workbook)
+    document["workbook"]["sheet"] = "Invoices"
+    console = ScriptedConsole(["3"], [SOURCE_SECRET])
+
+    result = run_wizard(console.prompter(), profile=parse_profile(document), list_sheets=sheets_of)
+
+    assert result.sheet_name == "Fines"
+    assert "is not in this workbook, so the question is being asked" in console.transcript

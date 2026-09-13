@@ -313,9 +313,9 @@ preserved untouched.
 Close the workbook in Excel first — Excel holds a lock, and a `~$name.xlsx` file
 next to it is the sign that it is still open.
 
-### 3. Answer the fifteen questions
+### 3. Answer the questions
 
-In this order, each one re-asked until it is valid:
+One at a time, in this order, each re-asked until it is valid:
 
 | # | Question | Notes |
 | --- | --- | --- |
@@ -325,22 +325,100 @@ In this order, each one re-asked until it is valid:
 | 4 | Source server | Hostname or IP. |
 | 5 | Source port | Enter accepts 1433, or 1521 for Oracle. |
 | 6 | Source database or service name | Service name when the source is Oracle. |
-| 7 | Trust the source certificate? | SQL Server only, so an Oracle source is asked 14 questions. |
-| 8 | Source username | |
-| 9 | Source password | Hidden. Never echoed, logged or stored. |
-| 10 | Target server | The target is always SQL Server. |
-| 11 | Target port | Enter accepts 1433. |
-| 12 | Target database name | |
-| 13 | Trust the target certificate? | |
-| 14 | Target username | |
-| 15 | Target password | Hidden. |
+| 7 | Trust the source certificate? | SQL Server only. |
+| 8 | Source authentication | `windows` or `password`. SQL Server only; Oracle always uses a password. |
+| 9 | Source username | Skipped under Windows authentication. |
+| 10 | Source password | Hidden. Skipped under Windows authentication. |
+| 11 | Target server | The target is always SQL Server. |
+| 12 | Target port | Enter accepts 1433. |
+| 13 | Target database name | |
+| 14 | Trust the target certificate? | |
+| 15 | Target authentication | `windows` or `password`. |
+| 16 | Target username | Skipped under Windows authentication. |
+| 17 | Target password | Hidden. Skipped under Windows authentication. |
 
-Questions 7 and 13 exist because the connection is always encrypted. Answer `y`
-when the server presents a certificate this machine does not already trust,
-which is usual for local and internal servers; answer `n` to verify it properly.
+Between 13 and 17 questions are asked, depending on the answers: an Oracle
+source skips the certificate and authentication questions, and each side using
+Windows authentication skips a username and a password. The counter in the
+prompt shows the current total and says why it changed.
 
-Nothing is connected to, no sheet row is read and no query runs until all
-fifteen answers are in hand.
+Nothing is connected to, no sheet row is read and no query runs until every
+answer is in hand.
+
+#### Windows authentication
+
+Answering `windows` connects as the account already signed in to this machine.
+No username is typed, no password is typed, and none is placed in the connection
+string — it carries `Trusted_Connection=yes` instead of `UID`/`PWD`:
+
+```text
+[8/13] Source authentication (windows or password)
+      > windows
+      Source connection uses the signed-in Windows account; no password needed.
+```
+
+This is the safer option wherever the servers accept it, and it is what makes a
+completely unattended run possible. It needs a Windows account with access to
+the database, and it is SQL Server only — Oracle always asks for a username and
+password.
+
+The certificate questions (7 and 14) exist because the connection is always
+encrypted. Answer `y` when the server presents a certificate this machine does
+not already trust, which is usual for local and internal servers; `n` verifies
+it properly.
+
+### 3b. Or answer them from a file
+
+A profile is a TOML file holding the answers that never change:
+
+```powershell
+uv run python run_reconciliation.py --profile .\config\run_profile.example.toml
+```
+
+[`config/run_profile.example.toml`](config/run_profile.example.toml) is a
+commented template — copy it and edit. Every key is optional: what the file
+answers is **echoed on screen** and skipped, what it omits is still asked.
+
+```toml
+version = "1.0"
+
+[workbook]
+path = "C:/migration/payments_domain_reconciliation_v2.xlsx"
+sheet = "Payments"
+
+[source]
+type = "oracle"                  # "oracle" or "sqlserver"
+server = "legacy-ora.corp.local"
+port = 1521                      # omit to accept the default for the type
+database = "LEGACYPAY"           # the SERVICE NAME when type = "oracle"
+authentication = "password"
+username = "recon_reader"
+
+[target]                         # always SQL Server, so there is no `type` key
+server = "sql-mig-01.corp.local"
+port = 1433
+database = "PaymentsMigrated"
+trust_server_certificate = true
+authentication = "windows"       # needs no username and no password
+```
+
+A run using that profile asks exactly one question — the Oracle password — and
+prints what it took from the file:
+
+```text
+      [profile] Sheet: Payments
+      [profile] Source server (hostname or IP): legacy-ora.corp.local
+      [profile] Target authentication (windows or password): windows
+      Target connection uses the signed-in Windows account; no password needed.
+```
+
+With `authentication = "windows"` on both sides, the run asks **nothing at all**.
+
+> **A profile never contains a password.** There is no key for one, and a file
+> containing `password`, `pwd`, `secret`, `token` or similar is **rejected**,
+> not ignored — so putting one there fails loudly instead of silently leaving a
+> credential on disk. A profile pointing at a workbook or sheet that does not
+> exist falls back to asking rather than failing.
 
 ### 4. Read the pre-flight, then the results
 
@@ -373,18 +451,19 @@ Run 11e39e7daf1b - payments_demo.xlsx
 
 ### Repeat runs
 
-Three optional flags exist, because they change *what runs* rather than supply
+Four optional flags exist, because they change *what runs* rather than supply
 information the script needs:
 
 ```powershell
 uv run python run_reconciliation.py --case TC-PAY-008
 uv run python run_reconciliation.py --limit 2
 uv run python run_reconciliation.py --output-dir .\out
+uv run python run_reconciliation.py --profile .\config\my_profile.toml --limit 2
 ```
 
-There is deliberately no `--source-server`, no `--sheet-name` and no
-`--password`. Every run asks for everything again, including both passwords,
-even when the answers are identical to the last run.
+Those four are the only flags. There is deliberately no `--source-server`, no
+`--sheet-name` and no `--password`: connection details are typed in or come from
+a profile, and a password is only ever typed at a hidden prompt.
 
 ### When a connection fails
 
@@ -421,7 +500,7 @@ defence, not a replacement for permissions.
 
 ```text
 run_reconciliation.py   The interactive runner: fifteen questions, two live databases
-config/                 Workbook schema DSL, used by the offline `reconcile` command
+config/                 Workbook schema DSL, plus the run-profile template
 templates/              A generated example workbook matching the example schema
 src/                    The framework (see ARCHITECTURE.md)
 tests/                  Offline unit tests; tests/integration is an opt-in placeholder

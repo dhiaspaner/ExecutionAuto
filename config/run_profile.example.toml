@@ -1,0 +1,65 @@
+# Run profile — pre-answers the questions run_reconciliation.py would ask.
+#
+# Use it when the same workbook runs against the same two servers regularly:
+#
+#     uv run python run_reconciliation.py --profile config/run_profile.example.toml
+#
+# Copy this file, change the values, and keep your copy next to the workbook or
+# anywhere convenient. Every key is OPTIONAL: whatever is here is used and shown
+# on screen, and whatever is missing is asked for one question at a time, exactly
+# as it would be without a profile.
+#
+# ---------------------------------------------------------------------------
+# THIS FILE MUST NEVER CONTAIN A PASSWORD.
+# ---------------------------------------------------------------------------
+# There is no `password` key and none will be added. A file containing one — or
+# `pwd`, `secret`, `token` or similar — is REJECTED, not quietly ignored, so a
+# mistake is loud rather than silent.
+#
+# Two ways to avoid typing a password at all:
+#
+#   authentication = "windows"   The account already signed in to Windows
+#                                connects. Nothing is typed, stored or sent.
+#                                SQL Server only.
+#
+#   authentication = "password"  A username lives here; the password is typed
+#                                at runtime with a hidden prompt, kept in memory
+#                                for the run, and never written anywhere.
+
+version = "1.0"
+
+[workbook]
+# Absolute path, or relative to wherever you run the command from.
+# On Windows either "C:/data/payments.xlsx" or "C:\\data\\payments.xlsx" works.
+path = "C:/migration/payments_domain_reconciliation_v2.xlsx"
+# The worksheet holding the test cases. Its columns must be ID, Source SQL and
+# Target SQL, plus the result columns. The sheet may be named anything.
+sheet = "Payments"
+
+# ---------------------------------------------------------------------------
+# The legacy system being migrated FROM. Oracle or SQL Server.
+# ---------------------------------------------------------------------------
+[source]
+type = "oracle"                      # "oracle" or "sqlserver"
+server = "legacy-ora.corp.local"
+port = 1521                          # omit to accept 1521 for Oracle, 1433 for SQL Server
+database = "LEGACYPAY"               # the SERVICE NAME when type = "oracle"
+authentication = "password"          # Oracle supports "password" only
+username = "recon_reader"            # omit under Windows authentication
+# trust_server_certificate = true    # SQL Server sources only
+
+# ---------------------------------------------------------------------------
+# The migrated system being reconciled TO. Always SQL Server, so there is no
+# `type` key here.
+# ---------------------------------------------------------------------------
+[target]
+server = "sql-mig-01.corp.local"
+port = 1433
+database = "PaymentsMigrated"
+# Answer true when the server presents a certificate this machine does not
+# already trust, which is usual for local and internal servers. false verifies
+# the certificate properly.
+trust_server_certificate = true
+# "windows" connects as the signed-in account and needs no username at all.
+authentication = "windows"
+# username = "svc_recon"             # required when authentication = "password"

@@ -78,7 +78,7 @@ class SqlServerExecutor:
             database_type=self._settings.database_type,
             server_description=f"{self._settings.server}:{self._settings.port}",
             database_name=self._settings.database,
-            account_name=self._settings.username,
+            account_name=self._account_name(),
             product_version=self._product_version(),
         )
 
@@ -159,8 +159,15 @@ class SqlServerExecutor:
             f"DRIVER={{{self._choose_driver(module)}}}",
             f"SERVER={settings.server},{settings.port}",
             f"DATABASE={settings.database}",
-            f"UID={settings.username}",
-            f"PWD={settings.password}",
+        ]
+        if settings.uses_windows_authentication:
+            # The signed-in Windows account authenticates. No username and no
+            # password are placed in the connection string at all.
+            parts.append("Trusted_Connection=yes")
+        else:
+            parts.append(f"UID={settings.username}")
+            parts.append(f"PWD={settings.password}")
+        parts += [
             "Encrypt=yes",
             f"TrustServerCertificate={'yes' if settings.trust_server_certificate else 'no'}",
             f"Connection Timeout={settings.connect_timeout}",
@@ -178,6 +185,12 @@ class SqlServerExecutor:
             if candidate in installed:
                 return candidate
         return PREFERRED_DRIVERS[0]
+
+    def _account_name(self) -> str:
+        """Who the session authenticated as, for the connection summary."""
+        if self._settings.uses_windows_authentication:
+            return "(Windows authentication)"
+        return self._settings.username
 
     def _product_version(self) -> str:
         """Ask the driver for the server version. Absence is not an error."""

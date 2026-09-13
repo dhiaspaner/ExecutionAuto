@@ -61,11 +61,22 @@ def workbook(tmp_path: Path) -> Path:
     return path
 
 
-def answers_for(workbook: Path, *, source_type: str = "sqlserver") -> list[str]:
+def answers_for(
+    workbook: Path,
+    *,
+    source_type: str = "sqlserver",
+    source_auth: str = "password",
+    target_auth: str = "password",
+) -> list[str]:
     common = [str(workbook), SHEET, source_type, "legacy-host", "", "LegacyDb"]
     if source_type == "sqlserver":
         common.append("y")  # trust the source certificate
-    common += ["legacy_reader", "new-host", "", "MigratedDb", "y", "migrated_reader"]
+        common.append(source_auth)
+    if source_type == "oracle" or source_auth == "password":
+        common.append("legacy_reader")
+    common += ["new-host", "", "MigratedDb", "y", target_auth]
+    if target_auth == "password":
+        common.append("migrated_reader")
     return common
 
 
@@ -251,7 +262,9 @@ def test_no_password_flag_exists() -> None:
     parser = run_reconciliation.build_parser()
     flags = {action.option_strings[0] for action in parser._actions if action.option_strings}
 
-    assert flags == {"-h", "--case", "--limit", "--output-dir"}
+    assert flags == {"-h", "--profile", "--case", "--limit", "--output-dir"}
+    assert not any("password" in flag for flag in flags)
+    assert not any("server" in flag or "user" in flag for flag in flags)
 
 
 # -- failures ------------------------------------------------------------
@@ -380,3 +393,180 @@ def test_optional_columns_are_honoured_when_present_and_defaulted_when_absent() 
     assert schema.field("comparison_rule").default == "equal"
     assert schema.field("comparison_rule").required is False
     assert schema.field("timeout_seconds").default == 120
+
+
+# -- Windows authentication and profiles, end to end ---------------------
+
+
+def test_windows_authentication_needs_no_password_at_all(
+    workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console.script(answers_for(workbook, source_auth="windows", target_auth="windows"))
+    console.secrets = []  # nothing may ask for one
+    source = FakeConnection()
+    target = FakeConnection()
+    use_drivers(monkeypatch, FakePyodbc(connection=source), FakePyodbc(connection=target))
+
+    code = run_reconciliation.main([])
+
+    assert code == run_reconciliation.EXIT_OK
+    assert "Trusted_Connection=yes" in source.connection_string
+    assert "UID=" not in source.connection_string
+    assert "PWD=" not in source.connection_string
+    assert "Trusted_Connection=yes" in target.connection_string
+
+
+def test_password_authentication_still_sends_credentials(
+    workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console.script(answers_for(workbook))
+    source = FakeConnection()
+    use_drivers(monkeypatch, FakePyodbc(connection=source), FakePyodbc())
+
+    run_reconciliation.main([])
+
+    assert "UID=legacy_reader" in source.connection_string
+    assert f"PWD={SOURCE_SECRET}" in source.connection_string
+    assert "Trusted_Connection" not in source.connection_string
+
+
+def test_the_connection_summary_names_windows_authentication(
+    workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    console.script(answers_for(workbook, source_auth="windows", target_auth="windows"))
+    console.secrets = []
+    use_drivers(monkeypatch, FakePyodbc(), FakePyodbc())
+
+    run_reconciliation.main([])
+
+    assert "(Windows authentication)" in capsys.readouterr().out
+
+
+def write_profile(path: Path, body: str) -> Path:
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_a_profile_answers_the_questions_through_the_real_entry_point(
+    workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: Any
+) -> None:
+    profile = write_profile(
+        tmp_path / "profile.toml",
+        f'''
+version = "1.0"
+
+[workbook]
+path = "{workbook.as_posix()}"
+sheet = "{SHEET}"
+
+[source]
+type = "sqlserver"
+server = "legacy-host"
+port = 1433
+database = "LegacyDb"
+trust_server_certificate = true
+authentication = "windows"
+
+[target]
+server = "new-host"
+port = 1433
+database = "MigratedDb"
+trust_server_certificate = false
+authentication = "windows"
+''',
+    )
+    console.script([])  # every question is answered by the file
+    console.secrets = []
+    use_drivers(monkeypatch, FakePyodbc(), FakePyodbc())
+
+    code = run_reconciliation.main(["--profile", str(profile)])
+
+    out = capsys.readouterr().out
+    assert code == run_reconciliation.EXIT_OK
+    assert "[profile] Sheet: Payments" in out
+    assert "3 passed" in out
+
+
+def test_a_profile_still_prompts_for_the_password(
+    workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = write_profile(
+        tmp_path / "profile.toml",
+        f'''
+version = "1.0"
+
+[workbook]
+path = "{workbook.as_posix()}"
+sheet = "{SHEET}"
+
+[source]
+type = "sqlserver"
+server = "legacy-host"
+port = 1433
+database = "LegacyDb"
+trust_server_certificate = true
+authentication = "password"
+username = "legacy_reader"
+
+[target]
+server = "new-host"
+port = 1433
+database = "MigratedDb"
+trust_server_certificate = true
+authentication = "password"
+username = "svc_recon"
+''',
+    )
+    console.script([])
+    source = FakeConnection()
+    use_drivers(monkeypatch, FakePyodbc(connection=source), FakePyodbc())
+
+    code = run_reconciliation.main(["--profile", str(profile)])
+
+    assert code == run_reconciliation.EXIT_OK
+    assert f"PWD={SOURCE_SECRET}" in source.connection_string
+    assert console.secrets == []  # both hidden prompts were consumed
+
+
+def test_a_profile_containing_a_password_is_refused(
+    workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: Any
+) -> None:
+    profile = write_profile(
+        tmp_path / "leaky.toml",
+        f'''
+version = "1.0"
+
+[workbook]
+path = "{workbook.as_posix()}"
+
+[source]
+type = "sqlserver"
+server = "legacy-host"
+database = "LegacyDb"
+username = "legacy_reader"
+password = "hunter2"
+''',
+    )
+    console.script([])
+    driver = FakePyodbc()
+    use_drivers(monkeypatch, driver, FakePyodbc())
+
+    code = run_reconciliation.main(["--profile", str(profile)])
+
+    captured = capsys.readouterr()
+    assert code == run_reconciliation.EXIT_USAGE
+    assert "never contain a password" in captured.err
+    assert "hunter2" not in captured.err + captured.out
+    assert driver.connections == []
+
+
+def test_a_missing_profile_file_is_reported(
+    console: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: Any
+) -> None:
+    console.script([])
+    use_drivers(monkeypatch, FakePyodbc(), FakePyodbc())
+
+    code = run_reconciliation.main(["--profile", str(tmp_path / "nope.toml")])
+
+    assert code == run_reconciliation.EXIT_USAGE
+    assert "Cannot read profile" in capsys.readouterr().err

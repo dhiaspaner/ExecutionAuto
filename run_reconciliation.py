@@ -15,6 +15,7 @@ never logged, and never written to the result workbook.
 Three optional flags exist, all of them execution modifiers rather than
 information the script needs to run:
 
+``--profile FILE``   a TOML file that pre-answers the questions (never a password)
 ``--case ID``        run only this test case; repeatable
 ``--limit N``        run at most N cases, for a pilot
 ``--output-dir DIR`` where to put the result workbook
@@ -34,6 +35,7 @@ from migration_reconciliation.database.base import QuerySide
 from migration_reconciliation.database.live import LiveExecutorFactory
 from migration_reconciliation.errors import ReconciliationError
 from migration_reconciliation.models import WorkbookSchema
+from migration_reconciliation.profile import RunProfile, load_profile
 from migration_reconciliation.reporting import (
     make_output_encoding_safe,
     render_identity,
@@ -66,6 +68,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Connection details are asked for interactively; there are no flags for them."
         ),
         epilog="Passwords are never accepted as arguments and never stored.",
+    )
+    parser.add_argument(
+        "--profile",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "TOML file answering any of the connection questions. It never contains a "
+            "password: one is still prompted for, unless Windows authentication is used."
+        ),
     )
     parser.add_argument(
         "--case",
@@ -106,7 +117,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _run(args: argparse.Namespace) -> int:
     _banner()
-    answers = run_wizard()
+    profile = RunProfile.empty()
+    if args.profile is not None:
+        profile = load_profile(args.profile)
+        _emit(f"  Profile          : {args.profile}")
+    answers = run_wizard(profile=profile)
     schema = build_inline_schema(answers.sheet_name, answers.source.database_type)
 
     factory = LiveExecutorFactory(answers.source, answers.target)

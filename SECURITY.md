@@ -9,34 +9,55 @@ repository to them.
 
 ## 1. Offline-first development
 
-Milestone 1 contains **no database connectivity at all**:
+Two entry points exist, and only one of them can reach a database:
 
-* Neither `pyodbc` nor `oracledb` is a dependency, and neither is imported
-  anywhere in `src/`. A test asserts that importing the runner pulls in no
-  driver module.
-* `create_executor_factory()` raises unless scripted results are supplied. There
-  is no silent fallback path that could reach a real server.
-* `reconcile test-connections` is an explicit "not available offline" placeholder
-  that exits non-zero.
-* The entire test suite passes with no credentials, no servers, no internet, no
-  Oracle Client and no ODBC drivers.
+* `reconcile` is **offline**. It answers every query from a TOML fixture
+  (`--fake-results`), and `create_executor_factory()` raises rather than falling
+  back to a real server. `reconcile test-connections` still exits non-zero.
+* `run_reconciliation.py` connects, using the answers given to its wizard.
 
-Development and review therefore happen with zero exposure. Real connectivity is
-a separate change that must be reviewed on its own terms.
+Neither `pyodbc` nor `oracledb` is a hard dependency: both are imported lazily,
+inside the adapter that needs one, so the framework imports and the whole test
+suite passes with no credentials, no servers, no internet, no Oracle Client and
+no ODBC driver installed. Every adapter test runs against a fake driver.
 
-## 2. No real database connections in milestone 1
+Development and review therefore still happen with zero exposure.
 
-Queries are answered from a TOML fixture (`--fake-results`). Nothing in this
-milestone opens a socket. No SQL written in a workbook is ever executed.
+## 2. Connections are deliberate, never incidental
+
+A connection is opened only when a person runs `run_reconciliation.py` and
+answers its questions. There is no configuration file, environment variable or
+default that can cause one on its own.
 
 A real connection may only be attempted when:
 
 1. An authorized person explicitly asks for it,
 2. read-only accounts exist on both source and target, and
-3. an approved local configuration is in place.
+3. that person supplies the connection details at the prompt or in a profile.
 
 Agents must never initiate a connection, test credentials, run integration
 tests against a database, or search the machine for stored credentials.
+
+### Authentication
+
+`run_reconciliation.py` offers two modes per connection:
+
+| Mode | What is typed | What travels |
+| --- | --- | --- |
+| `windows` | Nothing | `Trusted_Connection=yes`; the signed-in Windows account authenticates. SQL Server only. |
+| `password` | Username, then a hidden `getpass` prompt | `UID` and `PWD`, held in process memory for the run only. |
+
+Windows authentication is preferred wherever the servers accept it: no
+credential is typed, stored or handled by this program at all.
+
+### Run profiles
+
+`--profile file.toml` pre-answers connection questions. A profile may carry a
+server, port, database, authentication mode and username. It may **not** carry a
+password: the keys `password`, `pwd`, `passwd`, `secret`, `token` and
+`credential` are rejected outright, so a credential placed there fails the run
+instead of sitting on disk. Every value a profile supplies is echoed to the
+console, so nothing is applied invisibly.
 
 ## 3. Client-controlled execution
 
@@ -71,15 +92,16 @@ must be granted `SELECT` only, on both the source and the target.
 
 ## 6. Interactive credentials, entered hidden
 
-When adapters arrive, `interactive` authentication will:
+`interactive` authentication (`authentication = "password"`) does this today:
 
-* prompt for the username at runtime;
-* read the password with `getpass`, so it is never echoed;
-* prompt **once per logical connection per run**, reusing that connection;
-* keep the password in process memory only, for the lifetime of the run;
-* close connections when the run ends.
+* prompts for the username at runtime, or takes it from a profile;
+* reads the password with `getpass`, so it is never echoed;
+* prompts **once per connection per run**, reusing that connection for every
+  test case;
+* keeps the password in process memory only, for the lifetime of the run;
+* closes both connections when the run ends, including after a failure.
 
-A password will never be: accepted as a command-line argument, written into
+A password is never: accepted as a command-line argument, written into
 Python, stored in a workbook, stored in TOML, read from an environment variable,
 committed to Git, printed, logged, written to a result workbook, or included in
 an exception message. Complete connection strings are never printed.
@@ -87,19 +109,20 @@ an exception message. Complete connection strings are never printed.
 `--password` does not exist. A test asserts the CLI exposes no such option. Do
 not add one.
 
-## 7. Optional Windows Integrated Authentication
+## 7. Windows Integrated Authentication
 
-For SQL Server, `integrated` authentication may be used **where the DBA has
-approved it**. The run then executes as the signed-in Windows account: nothing is
-prompted, nothing is stored.
+For SQL Server, answering `windows` at the authentication question connects as
+the signed-in Windows account: nothing is prompted, nothing is stored, and the
+connection string carries `Trusted_Connection=yes` in place of `UID` and `PWD`.
+Use it **where the DBA has approved it**.
 
-If integrated authentication fails, the run stops with a clear error. It must
-**never** silently fall back to prompting — a silent downgrade hides a
+If integrated authentication fails, the run stops with a classified error. It
+**never** silently falls back to prompting — a silent downgrade hides a
 misconfiguration and trains people to type credentials at unexpected moments.
 
-Oracle normally uses `interactive` in version 1. A secret manager may be added
-later for unattended execution; environment-variable authentication is not part
-of version 1.
+Oracle always uses `password` authentication; a profile requesting `windows` for
+an Oracle source is rejected. A secret manager may be added later for unattended
+execution; environment-variable authentication is not part of version 1.
 
 ## 8. No credentials in arguments, files, variables or logs
 
