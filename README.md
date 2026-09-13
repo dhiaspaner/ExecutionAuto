@@ -12,10 +12,15 @@ original is never modified.
 New domains, entities and templates are added by editing Excel and TOML. They do
 not require a Python change.
 
-> **Milestone 1 is offline.** No database driver is imported, no credential is
-> read, and no network call is made. Queries run against scripted results from a
-> TOML file so the whole pipeline can be exercised and reviewed before anything
-> touches a real system. See [SECURITY.md](SECURITY.md).
+There are two ways to run it:
+
+| Entry point | What it does |
+| --- | --- |
+| `reconcile` | The offline command. Schema-driven, with scripted results from a TOML file and no database at all. Use it to validate a workbook or rehearse a run. |
+| `run_reconciliation.py` | The interactive runner. Asks fifteen questions, connects to a real source and target, and executes the workbook. |
+
+> Neither one accepts a password as an argument, reads a credential from a file
+> or an environment variable, or writes one anywhere. See [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -251,32 +256,174 @@ is reported as `ERROR` on the `COMPARISON` side rather than being coerced.
 
 ---
 
-## Database adapters are not enabled yet
+## Run against real databases
 
-There is no `pyodbc` and no `oracledb` in this milestone, and
-`reconcile test-connections` deliberately refuses to run:
+`run_reconciliation.py` executes a workbook against a live source and target.
+It takes no connection arguments at all: it asks, one question at a time, and
+will not move on until each answer is valid.
 
-```text
-reconcile: test-connections is not available in offline mode: no database
-adapter is registered in this milestone.
+```powershell
+uv run python run_reconciliation.py
 ```
 
-No file in this repository holds connection details, and none will: server,
-database, username and password are asked for at runtime, the password with
-`getpass`, and kept in memory for the life of the run only.
+### 1. Install the driver you need
 
-Enabling real connectivity is a separate, reviewed piece of work. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for where the adapters plug in and
-[SECURITY.md](SECURITY.md) for the rules they must satisfy.
+`pyodbc` is used for every SQL Server connection; `oracledb` only if a source is
+Oracle. Both are imported lazily, so the one you do not use never has to be
+installed.
+
+```powershell
+uv add pyodbc
+uv add oracledb    # only for an Oracle source
+```
+
+On Windows, `pyodbc` also needs Microsoft's ODBC driver:
+
+```powershell
+winget install --id=Microsoft.msodbcsql.18 -e
+```
+
+The newest installed driver is selected automatically, from `ODBC Driver 18`
+down to the legacy `SQL Server` driver. `oracledb` runs in thin mode and needs
+no Oracle Client.
+
+### 2. Prepare the workbook
+
+The sheet is found by the name you choose at question 2, so it can be called
+anything. The **column headers are fixed** — they are constants in the script,
+not a schema file:
+
+| Column | Required | Purpose |
+| --- | --- | --- |
+| `ID` | yes | Test case identifier, unique within the sheet. |
+| `Source SQL` | yes | Read-only query for the source database, in its own dialect. |
+| `Target SQL` | yes | Read-only query for the target database. |
+| `Source Results` | result | The source scalar. |
+| `Target Results` | result | The target scalar. |
+| `Variance` | result | Computed in Python, never an Excel formula. |
+| `Status` | result | `PASS`, `FAIL`, `ERROR` or `SKIPPED`. |
+| `Remarks` | result | Why it passed, failed or errored. |
+
+Four more columns are used **if they exist** and defaulted if they do not:
+`Enabled` (default true), `Comparison Rule` (default `equal`), `Tolerance`
+(default 0) and `Timeout Seconds` (default 120). `Domain` and `Entity` are read
+for reporting. Any other column is left alone, and every other worksheet is
+preserved untouched.
+
+Close the workbook in Excel first — Excel holds a lock, and a `~$name.xlsx` file
+next to it is the sign that it is still open.
+
+### 3. Answer the fifteen questions
+
+In this order, each one re-asked until it is valid:
+
+| # | Question | Notes |
+| --- | --- | --- |
+| 1 | Path to the workbook (.xlsx) | Must exist. A path pasted with quotes is fine. |
+| 2 | Which sheet | Sheets are listed and numbered; answer by number or name. |
+| 3 | Source database type | `sqlserver` or `oracle`. |
+| 4 | Source server | Hostname or IP. |
+| 5 | Source port | Enter accepts 1433, or 1521 for Oracle. |
+| 6 | Source database or service name | Service name when the source is Oracle. |
+| 7 | Trust the source certificate? | SQL Server only, so an Oracle source is asked 14 questions. |
+| 8 | Source username | |
+| 9 | Source password | Hidden. Never echoed, logged or stored. |
+| 10 | Target server | The target is always SQL Server. |
+| 11 | Target port | Enter accepts 1433. |
+| 12 | Target database name | |
+| 13 | Trust the target certificate? | |
+| 14 | Target username | |
+| 15 | Target password | Hidden. |
+
+Questions 7 and 13 exist because the connection is always encrypted. Answer `y`
+when the server presents a certificate this machine does not already trust,
+which is usual for local and internal servers; answer `n` to verify it properly.
+
+Nothing is connected to, no sheet row is read and no query runs until all
+fifteen answers are in hand.
+
+### 4. Read the pre-flight, then the results
+
+Both connections open first and describe themselves, then the sheet is read and
+summarised — enabled cases, disabled cases, invalid rows — before a single query
+is sent. A run looks like this:
+
+```text
+Connecting...
+  SOURCE  oracle at legacy-ora.corp.local:1521 db=LEGACYPAY user=recon_reader version=19.3.0.0.0
+  TARGET  sqlserver at sql-mig-01.corp.local:1433 db=PaymentsMigrated user=svc_recon version=16.00.4125
+
+Sheet 'Payments':
+  enabled cases  : 3
+  disabled cases : 0
+  invalid rows   : 0
+
+Executing...
+
+Run 11e39e7daf1b - payments_demo.xlsx
+------------------------------------------------------------------------
+  PASS    TC-PAY-001     row 2       31 ms  Source and target numeric results are equal.
+  PASS    TC-PAY-002     row 3       28 ms  Source and target numeric results are equal.
+  FAIL    TC-PAY-003     row 4       26 ms  Mismatch: source 4201 != target 4198.
+------------------------------------------------------------------------
+  2 passed, 1 failed, 0 errors, 0 skipped (3 executed in 605 ms)
+  Results written to: ...\payments_demo_results_20260913_104633.xlsx
+  Original workbook unchanged: ...\payments_demo.xlsx
+```
+
+### Repeat runs
+
+Three optional flags exist, because they change *what runs* rather than supply
+information the script needs:
+
+```powershell
+uv run python run_reconciliation.py --case TC-PAY-008
+uv run python run_reconciliation.py --limit 2
+uv run python run_reconciliation.py --output-dir .\out
+```
+
+There is deliberately no `--source-server`, no `--sheet-name` and no
+`--password`. Every run asks for everything again, including both passwords,
+even when the answers are identical to the last run.
+
+### When a connection fails
+
+Connections give up after 15 seconds, so an unreachable host fails while you are
+still watching rather than hanging. The message names the likely cause instead of
+echoing the driver's exception, which can contain the connection string:
+
+| Message says | Usually means |
+| --- | --- |
+| the server could not be reached in time | Wrong hostname or port, VPN not connected, firewall blocking |
+| the server rejected the credentials | Wrong username or password, or a locked or expired account |
+| the database or service could not be opened | Wrong database or service name, or the account lacks permission |
+| the database driver is missing | Install ODBC Driver 18 for SQL Server |
+
+A failure in one test case does not stop the run: it becomes one `ERROR` row
+with a sanitized message, and the remaining cases still execute.
+
+### What the adapters will not do
+
+* Execute anything but a single read-only `SELECT` or `WITH` statement — the
+  guard runs before the query reaches the driver.
+* Fetch more than two rows. A query that wrongly matches a whole table is
+  rejected rather than pulled into this process.
+* Translate SQL between dialects. Each query goes to its driver verbatim.
+* Write a password, a connection string or any query output to the workbook, a
+  log or an error message.
+
+Read-only database accounts remain mandatory. The SQL guard is a second line of
+defence, not a replacement for permissions.
 
 ---
 
 ## Repository layout
 
 ```text
-config/     Workbook schema DSL
-templates/  A generated example workbook matching the example schema
-src/        The framework (see ARCHITECTURE.md)
-tests/      Offline unit tests; tests/integration is an opt-in placeholder
-AGENTS.md   Mandatory rules for anyone (human or agent) changing this repo
+run_reconciliation.py   The interactive runner: fifteen questions, two live databases
+config/                 Workbook schema DSL, used by the offline `reconcile` command
+templates/              A generated example workbook matching the example schema
+src/                    The framework (see ARCHITECTURE.md)
+tests/                  Offline unit tests; tests/integration is an opt-in placeholder
+AGENTS.md               Mandatory rules for anyone (human or agent) changing this repo
 ```

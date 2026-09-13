@@ -18,7 +18,6 @@ accepts a credential. ``--password`` does not exist and must never be added.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -27,6 +26,7 @@ from .database.factory import create_executor_factory, real_adapters_available
 from .database.fake import load_fake_results
 from .errors import ReconciliationError
 from .models import RunSummary, WorkbookSchema
+from .reporting import make_output_encoding_safe, render_summary
 from .runner import ReconciliationRunner, RunOptions
 from .security.redaction import sanitize_error
 from .workbook.reader import validate_workbook
@@ -144,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    _make_output_encoding_safe()
+    make_output_encoding_safe()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -233,44 +233,9 @@ def _cmd_make_template(args: argparse.Namespace) -> int:
 
 
 def _report(summary: RunSummary) -> None:
-    _emit("")
-    _emit(f"Run {summary.run_id} - {summary.input_path.name}")
-    _emit("-" * 72)
-    for result in summary.results:
-        _emit(
-            f"  {result.status.value:<7} {result.test_case_id:<14} "
-            f"row {result.row_number:<4} {result.duration_ms:>5} ms  {result.remarks}"
-        )
-    _emit("-" * 72)
-    _emit(
-        f"  {summary.passed} passed, {summary.failed} failed, "
-        f"{summary.errored} errors, {summary.skipped} skipped "
-        f"({summary.executed} executed in {summary.duration_ms} ms)"
-    )
-    if summary.output_path is not None:
-        _emit(f"  Results written to: {summary.output_path}")
-        _emit(f"  Original workbook unchanged: {summary.input_path}")
-    else:
-        _emit("  No result workbook written (--no-write).")
-    if not summary.is_clean:
-        _emit("")
-        _emit("  Review FAIL and ERROR rows above before signing off the migration.")
-
-
-def _make_output_encoding_safe() -> None:
-    """Never let a console code page turn a finished run into a traceback.
-
-    Windows picks the active code page for redirected output, and a legacy one
-    such as cp437 cannot encode every character a message may carry. Degrading
-    a stray character to ``?`` is always better than losing the run report.
-    """
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:  # pragma: no cover - replaced stream (pytest capture)
-            continue
-        # A detached or closed stream is nothing to fail a run over.
-        with contextlib.suppress(ValueError, OSError):
-            reconfigure(errors="replace")
+    note = "  No result workbook written (--no-write)."
+    for line in render_summary(summary, no_output_note=note):
+        _emit(line)
 
 
 def _emit(message: str) -> None:
