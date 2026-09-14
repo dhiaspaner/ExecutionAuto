@@ -18,11 +18,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..errors import DatabaseExecutionError
+from ..errors import (
+    ConnectionFailedError,
+    DatabaseExecutionError,
+    NonScalarResultError,
+    QueryTimeoutError,
+)
 from ..models import ConnectionIdentity, ScalarValue
 from ..security.redaction import sanitize_error
 from .base import single_scalar
-from .failures import connection_failure_message
+from .failures import connection_failure_message, is_timeout_failure
 from .settings import ConnectionSettings
 
 __all__ = ["PREFERRED_DRIVERS", "SqlServerExecutor"]
@@ -63,7 +68,7 @@ class SqlServerExecutor:
                 autocommit=True,
             )
         except Exception as exc:
-            raise DatabaseExecutionError(connection_failure_message(exc, self._settings)) from None
+            raise ConnectionFailedError(connection_failure_message(exc, self._settings)) from None
 
     def test_connection(self) -> ConnectionIdentity:
         """Confirm the connection works and describe it without secrets.
@@ -105,21 +110,19 @@ class SqlServerExecutor:
             try:
                 cursor.execute(sql)
             except Exception as exc:
-                raise DatabaseExecutionError(
-                    f"{label} failed: {sanitize_error(exc, max_length=200)}"
-                ) from None
+                raise _execution_failure(exc, label, timeout_seconds) from None
             if cursor.description is None:
-                raise DatabaseExecutionError(
+                raise NonScalarResultError(
                     f"{label} returned no result set; exactly one row and one column is required"
                 )
             column_count = len(cursor.description)
             rows = cursor.fetchmany(2)
             if len(rows) > 1:
-                raise DatabaseExecutionError(
+                raise NonScalarResultError(
                     f"{label} returned more than one row; exactly one row is required"
                 )
             if rows and column_count != 1:
-                raise DatabaseExecutionError(
+                raise NonScalarResultError(
                     f"{label} returned {column_count} columns; exactly one column is required"
                 )
             return single_scalar([list(row) for row in rows], label=label)
@@ -215,3 +218,13 @@ def _quietly(action: Any) -> None:
         action()
     except Exception:
         return
+
+
+def _execution_failure(
+    exc: BaseException, label: str, timeout_seconds: int
+) -> DatabaseExecutionError:
+    """Classify a driver failure so the caller gets a specific error code."""
+    message = f"{label} failed: {sanitize_error(exc, max_length=200)}"
+    if is_timeout_failure(exc):
+        return QueryTimeoutError(f"{label} exceeded the {timeout_seconds}s timeout. {message}")
+    return DatabaseExecutionError(message)

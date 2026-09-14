@@ -19,7 +19,7 @@ authentication, which needs no credential at all.
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +27,14 @@ from .database.settings import AuthMode
 from .errors import ReconciliationError
 from .models import DatabaseType
 
-__all__ = ["SUPPORTED_PROFILE_VERSIONS", "ConnectionProfile", "RunProfile", "load_profile"]
+__all__ = [
+    "FORBIDDEN_KEY_NAMES",
+    "SUPPORTED_PROFILE_VERSIONS",
+    "ConnectionProfile",
+    "RunProfile",
+    "load_profile",
+    "parse_profile",
+]
 
 SUPPORTED_PROFILE_VERSIONS: frozenset[str] = frozenset({"1.0"})
 
@@ -36,13 +43,39 @@ _ALLOWED_WORKBOOK_KEYS = frozenset({"path", "sheet"})
 _ALLOWED_SOURCE_KEYS = frozenset(
     {"type", "server", "port", "database", "trust_server_certificate", "authentication", "username"}
 )
-_ALLOWED_TARGET_KEYS = _ALLOWED_SOURCE_KEYS - {"type"}
+_ALLOWED_TARGET_KEYS = _ALLOWED_SOURCE_KEYS
 
-#: Keys that must never appear. Naming them explicitly turns "I put the password
-#: in the file and it was ignored" into a loud, immediate error.
-_FORBIDDEN_KEYS = frozenset(
-    {"password", "pwd", "passwd", "secret", "token", "credential", "credentials", "pass"}
+#: Keys that must never appear, anywhere in the document, at any depth. Naming
+#: them explicitly turns "I put the password in the file and it was ignored"
+#: into a loud, immediate error. Compared after :func:`_normalize_key`, so
+#: ``access_token``, ``accessToken`` and ``ACCESS-TOKEN`` are all the same key.
+FORBIDDEN_KEY_NAMES: frozenset[str] = frozenset(
+    {
+        "password",
+        "pwd",
+        "passwd",
+        "pass",
+        "secret",
+        "secrets",
+        "secretkey",
+        "clientsecret",
+        "token",
+        "accesstoken",
+        "authtoken",
+        "bearertoken",
+        "refreshtoken",
+        "sastoken",
+        "apikey",
+        "apitoken",
+        "credential",
+        "credentials",
+        "passphrase",
+        "privatekey",
+        "connectionstring",
+    }
 )
+
+_FORBIDDEN_KEYS = FORBIDDEN_KEY_NAMES
 
 MAX_PORT = 65535
 
@@ -70,6 +103,14 @@ class RunProfile:
     sheet_name: str | None = None
     #: Where it came from, for the "taken from the profile" messages.
     source_path: str = "<profile>"
+    #: True when ``[target].type`` was absent and the source engine was reused.
+    target_type_inherited: bool = False
+    #: Non-fatal notes to show the person before anything is opened.
+    warnings: tuple[str, ...] = ()
+
+    def section(self, name: str) -> ConnectionProfile | None:
+        """The connection table a workbook cell names, or ``None`` if unknown."""
+        return {"source": self.source, "target": self.target}.get(name.strip().casefold())
 
     @classmethod
     def empty(cls) -> RunProfile:
@@ -94,7 +135,7 @@ def load_profile(path: str | Path) -> RunProfile:
 
 def parse_profile(document: dict[str, Any], *, source: str = "<profile>") -> RunProfile:
     """Validate an already-parsed profile document."""
-    _reject_credentials(document, source, where="")
+    _reject_credentials(document, source, where="")  # whole tree, before anything else
     _reject_unknown(document, _ALLOWED_TOP_LEVEL_KEYS, source, where="")
 
     version = document.get("version")
@@ -114,8 +155,35 @@ def parse_profile(document: dict[str, Any], *, source: str = "<profile>") -> Run
     target_table = _table(document, "target", source)
     _reject_unknown(target_table, _ALLOWED_TARGET_KEYS, source, where="[target]")
 
-    source_profile = _connection(source_table, source, "[source]", allow_type=True)
-    target_profile = _connection(target_table, source, "[target]", allow_type=False)
+    source_profile = _connection(source_table, source, "[source]")
+    target_profile = _connection(target_table, source, "[target]")
+
+    warnings: list[str] = []
+    target_inherited = False
+    if target_profile.database_type is None and source_profile.database_type is not None:
+        # Older profiles omit [target].type entirely, because the target was
+        # always SQL Server. Inheriting the source engine keeps the new
+        # template's profiles working; the warning stops the inheritance from
+        # becoming an invisible default. Windows authentication is the one
+        # signal that overrides it: only SQL Server offers it, so inheriting
+        # "oracle" there would contradict what the file already says.
+        inherited = source_profile.database_type
+        if target_profile.auth_mode is AuthMode.WINDOWS and inherited is not DatabaseType.SQLSERVER:
+            inherited = DatabaseType.SQLSERVER
+        target_profile = replace(target_profile, database_type=inherited)
+        target_inherited = True
+        warnings.append(
+            f'{source}: [target] has no "type", so "{inherited.value}" is being used. '
+            'Add an explicit type = "sqlserver" (or "oracle") to [target].'
+        )
+
+    if (
+        target_profile.auth_mode is AuthMode.WINDOWS
+        and target_profile.database_type is DatabaseType.ORACLE
+    ):
+        raise ReconciliationError(
+            f"{source}: [target] Windows authentication is available for SQL Server only."
+        )
 
     return RunProfile(
         source=source_profile,
@@ -123,26 +191,22 @@ def parse_profile(document: dict[str, Any], *, source: str = "<profile>") -> Run
         workbook_path=Path(workbook_path).expanduser() if workbook_path else None,
         sheet_name=sheet_name,
         source_path=source,
+        target_type_inherited=target_inherited,
+        warnings=tuple(warnings),
     )
 
 
-def _connection(
-    table: dict[str, Any], source: str, where: str, *, allow_type: bool
-) -> ConnectionProfile:
+def _connection(table: dict[str, Any], source: str, where: str) -> ConnectionProfile:
     database_type: DatabaseType | None = None
-    if allow_type:
-        raw_type = _optional_string(table, "type", source, where)
-        if raw_type is not None:
-            try:
-                database_type = DatabaseType(raw_type.strip().casefold())
-            except ValueError:
-                allowed = ", ".join(engine.value for engine in DatabaseType)
-                raise ReconciliationError(
-                    f"{source}: {where} type must be one of: {allowed} (got {raw_type!r})"
-                ) from None
-    else:
-        # The target is always SQL Server; the schema does not offer the key.
-        database_type = DatabaseType.SQLSERVER
+    raw_type = _optional_string(table, "type", source, where)
+    if raw_type is not None:
+        try:
+            database_type = DatabaseType(raw_type.strip().casefold())
+        except ValueError:
+            allowed = ", ".join(engine.value for engine in DatabaseType)
+            raise ReconciliationError(
+                f"{source}: {where} type must be one of: {allowed} (got {raw_type!r})"
+            ) from None
 
     auth_mode: AuthMode | None = None
     raw_auth = _optional_string(table, "authentication", source, where)
@@ -167,7 +231,7 @@ def _connection(
         )
 
     return ConnectionProfile(
-        database_type=database_type if allow_type else None,
+        database_type=database_type,
         server=_optional_string(table, "server", source, where),
         port=_optional_port(table, "port", source, where),
         database=_optional_string(table, "database", source, where),
@@ -177,15 +241,31 @@ def _connection(
     )
 
 
-def _reject_credentials(table: dict[str, Any], source: str, *, where: str) -> None:
-    found = sorted(key for key in table if key.strip().casefold() in _FORBIDDEN_KEYS)
-    if found:
-        location = f" in {where}" if where else ""
-        raise ReconciliationError(
-            f"{source}: remove '{found[0]}'{location}. A profile must never contain a "
-            "password or any other credential: passwords are typed at runtime, or avoided "
-            'entirely with authentication = "windows".'
-        )
+def _normalize_key(key: str) -> str:
+    """Fold a key to its comparable form: ``API-Key`` and ``api_key`` are one key."""
+    return "".join(ch for ch in key.strip().casefold() if ch.isalnum())
+
+
+def _reject_credentials(value: object, source: str, *, where: str) -> None:
+    """Refuse any secret-like key, at any depth.
+
+    A shallow check would let ``[source.extra] password = "..."`` through and
+    then quietly ignore it, which is the worst of both worlds: the secret is on
+    disk and the person believes it is being used.
+    """
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if _normalize_key(str(key)) in FORBIDDEN_KEY_NAMES:
+                location = f" in {where}" if where else ""
+                raise ReconciliationError(
+                    f"{source}: remove '{key}'{location}. A profile must never contain a "
+                    "password or any other credential: passwords are typed at runtime, or "
+                    'avoided entirely with authentication = "windows". [FORBIDDEN_SECRET_KEY]'
+                )
+            _reject_credentials(nested, source, where=f"{where}.{key}" if where else f"[{key}]")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _reject_credentials(item, source, where=f"{where}[{index}]")
 
 
 def _table(document: dict[str, Any], key: str, source: str) -> dict[str, Any]:

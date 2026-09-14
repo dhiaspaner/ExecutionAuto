@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
-from ..errors import DatabaseExecutionError
+from ..errors import NonScalarResultError
 from ..models import ConnectionIdentity, DatabaseType, ScalarValue
 
 __all__ = ["ExecutorFactory", "QueryExecutor", "QuerySide", "single_scalar"]
@@ -80,14 +80,14 @@ def single_scalar(rows: Sequence[Sequence[ScalarValue]], *, label: str = "Query"
     """
     row_count = len(rows)
     if row_count == 0:
-        raise DatabaseExecutionError(f"{label} returned no rows; exactly one row is required")
+        raise NonScalarResultError(f"{label} returned no rows; exactly one row is required")
     if row_count > 1:
-        raise DatabaseExecutionError(
+        raise NonScalarResultError(
             f"{label} returned {row_count} rows; exactly one row is required"
         )
     column_count = len(rows[0])
     if column_count != 1:
-        raise DatabaseExecutionError(
+        raise NonScalarResultError(
             f"{label} returned {column_count} columns; exactly one column is required"
         )
     return rows[0][0]

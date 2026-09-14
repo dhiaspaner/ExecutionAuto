@@ -1,7 +1,7 @@
 [project]
 name = "migration-reconciliation"
-version = "0.1.0"
-description = "Workbook-driven data-migration reconciliation framework (offline milestone)."
+version = "0.2.0"
+description = "Workbook-driven data-migration reconciliation framework."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -28,6 +28,10 @@ packages = ["src/migration_reconciliation"]
 testpaths = ["tests"]
 addopts = "-q"
 pythonpath = ["."]
+# The domain vocabulary has classes called TestStatus, TestDefinition and
+# TestOutcome. Collecting by class-name prefix would try to instantiate them,
+# so this suite uses test functions only and class collection stays off.
+python_classes = []
 
 [tool.ruff]
 line-length = 100

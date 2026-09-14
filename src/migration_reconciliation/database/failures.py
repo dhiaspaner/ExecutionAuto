@@ -18,7 +18,13 @@ from enum import StrEnum
 from ..security.redaction import sanitize_error
 from .settings import ConnectionSettings
 
-__all__ = ["FailureCause", "classify_failure", "connection_failure_message"]
+__all__ = [
+    "FailureCause",
+    "classify_failure",
+    "connection_failure_message",
+    "describe_object_access_failure",
+    "is_timeout_failure",
+]
 
 
 class FailureCause(StrEnum):
@@ -142,3 +148,67 @@ def _oracle_code(exc: BaseException) -> tuple[int | None, str]:
     if isinstance(code, int):
         return code, prefix
     return None, prefix
+
+
+#: SQLSTATEs and vendor codes that mean "the query ran too long", as opposed to
+#: "the server could not be reached". Only the query-level ones belong here.
+_TIMEOUT_STATES = frozenset({"HYT00", "HYT01"})
+_TIMEOUT_ORACLE_CODES = frozenset({1013})  # ORA-01013 user requested cancel
+_TIMEOUT_DPY_CODES = frozenset({4024, 4011})  # call timeout, connection closed by timeout
+_TIMEOUT_PHRASES = ("timeout expired", "query timeout", "call timeout", "timed out")
+
+
+def is_timeout_failure(exc: BaseException) -> bool:
+    """True when a driver exception means the query exceeded its time limit.
+
+    Read conservatively: a false negative reports ``QUERY_EXECUTION_FAILED``
+    with the driver's own words, which is still diagnosable. A false positive
+    would hide a real error behind "it was slow".
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    state = _odbc_state(exc)
+    if state is not None and state in _TIMEOUT_STATES:
+        return True
+    code, prefix = _oracle_code(exc)
+    if code is not None:
+        table = _TIMEOUT_DPY_CODES if prefix == "DPY" else _TIMEOUT_ORACLE_CODES
+        if code in table:
+            return True
+    text = str(exc).casefold()
+    return any(phrase in text for phrase in _TIMEOUT_PHRASES)
+
+
+#: Fragments that mean "the object is there, but not through this session".
+#: Cross-database and linked-server references are the common cause in the
+#: Payments workbook, where SQL names `etables.dbo` and `DXBPRODSQL02.dbo`.
+_OBJECT_ACCESS_PHRASES = (
+    "invalid object name",
+    "could not find server",
+    "linked server",
+    "is not configured for",
+    "cannot open database",
+    "the server principal",
+    "permission was denied",
+    "select permission",
+    "table or view does not exist",
+)
+
+
+def describe_object_access_failure(message: str) -> str:
+    """Advice appended when a query names an object the session cannot reach.
+
+    The framework never rewrites the identifiers a workbook uses, so an
+    unreachable ``other_db.dbo.Thing`` is a configuration answer, not a query
+    to be edited: the login needs rights in that database, or the linked
+    server needs defining.
+    """
+    lowered = message.casefold()
+    if not any(phrase in lowered for phrase in _OBJECT_ACCESS_PHRASES):
+        return ""
+    return (
+        "The query names an object this session cannot reach. Cross-database or "
+        "linked-server access may need configuring: grant the login read access in "
+        "the other database, or define the linked server. The SQL is executed "
+        "verbatim and its identifiers are never rewritten."
+    )

@@ -85,7 +85,23 @@ def test_the_shipped_example_contains_no_credential_key() -> None:
 # -- credentials are refused, never ignored ------------------------------
 
 
-@pytest.mark.parametrize("key", ["password", "pwd", "passwd", "secret", "token", "credential"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "password",
+        "pwd",
+        "passwd",
+        "secret",
+        "token",
+        "credential",
+        "access_token",
+        "api_key",
+        "apikey",
+        "API-KEY",
+        "clientSecret",
+        "connection_string",
+    ],
+)
 def test_a_credential_key_is_rejected(key: str) -> None:
     bad = document()
     bad["source"][key] = "hunter2"
@@ -98,6 +114,41 @@ def test_a_top_level_credential_key_is_rejected() -> None:
     bad = document(password="hunter2")
 
     with pytest.raises(ReconciliationError, match="never contain a password"):
+        parse_profile(bad)
+
+
+def test_a_credential_key_is_rejected_at_any_depth() -> None:
+    """A nested secret that was merely ignored would still be a secret on disk."""
+    bad = document()
+    bad["source"]["extra"] = {"deeper": {"password": "hunter2"}}
+
+    with pytest.raises(ReconciliationError, match="never contain a password"):
+        parse_profile(bad)
+
+
+def test_a_credential_key_inside_an_array_of_tables_is_rejected() -> None:
+    bad = document()
+    bad["logins"] = [{"name": "svc", "api_key": "abc123"}]
+
+    with pytest.raises(ReconciliationError, match="never contain a password"):
+        parse_profile(bad)
+
+
+def test_password_is_allowed_as_a_value_because_it_names_a_mode() -> None:
+    """`authentication = "password"` is a choice, not a credential."""
+    with_password_auth = document()
+    with_password_auth["source"]["authentication"] = "password"
+
+    profile = parse_profile(with_password_auth)
+
+    assert profile.source.auth_mode is AuthMode.PASSWORD
+
+
+def test_the_rejection_names_the_error_code() -> None:
+    bad = document()
+    bad["source"]["password"] = "hunter2"
+
+    with pytest.raises(ReconciliationError, match="FORBIDDEN_SECRET_KEY"):
         parse_profile(bad)
 
 
@@ -142,13 +193,38 @@ def test_an_unknown_key_is_rejected() -> None:
         parse_profile(bad)
 
 
-def test_the_target_cannot_declare_an_engine() -> None:
-    """The target is always SQL Server, so the key does not exist."""
-    bad = document()
-    bad["target"]["type"] = "oracle"
+def test_the_target_may_declare_its_own_engine() -> None:
+    """The new template states the target engine explicitly."""
+    both_sqlserver = document()
+    both_sqlserver["source"]["type"] = "sqlserver"
+    both_sqlserver["target"]["type"] = "sqlserver"
 
-    with pytest.raises(ReconciliationError, match="unknown key"):
-        parse_profile(bad)
+    profile = parse_profile(both_sqlserver)
+
+    assert profile.target.database_type is DatabaseType.SQLSERVER
+    assert profile.target_type_inherited is False
+    assert profile.warnings == ()
+
+
+def test_a_missing_target_engine_is_inherited_with_a_warning() -> None:
+    inheriting = document()
+    inheriting["source"]["type"] = "sqlserver"
+    inheriting["target"].pop("type", None)
+
+    profile = parse_profile(inheriting)
+
+    assert profile.target.database_type is DatabaseType.SQLSERVER
+    assert profile.target_type_inherited is True
+    assert any('no "type"' in warning for warning in profile.warnings)
+
+
+def test_windows_authentication_overrides_an_inherited_oracle_engine() -> None:
+    """Only SQL Server offers Windows authentication, so it settles the engine."""
+    profile = parse_profile(document())  # oracle source, target without a type
+
+    assert profile.source.database_type is DatabaseType.ORACLE
+    assert profile.target.database_type is DatabaseType.SQLSERVER
+    assert profile.target_type_inherited is True
 
 
 def test_an_unknown_database_type_is_rejected() -> None:

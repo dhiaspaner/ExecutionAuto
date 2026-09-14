@@ -16,16 +16,22 @@ from pathlib import Path
 
 __all__ = [
     "ComparisonRule",
+    "ComparisonType",
     "ConnectionIdentity",
     "DatabaseType",
+    "ErrorCode",
     "ErrorSide",
     "ExecutionResult",
+    "ExecutionScope",
     "ExecutionStatus",
     "FieldDefinition",
     "FieldType",
+    "Platform",
+    "ResultType",
     "RunSummary",
     "ScalarValue",
     "TestCase",
+    "TestStatus",
     "WorkbookSchema",
 ]
 
@@ -231,3 +237,146 @@ class RunSummary:
     def is_clean(self) -> bool:
         """True when nothing failed and nothing errored."""
         return self.failed == 0 and self.errored == 0
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation workbook template v2
+#
+# The vocabulary below belongs to the TOML-driven template whose `Test Cases`
+# sheet declares an execution scope, a comparison type and a result type per
+# row. It is deliberately separate from the milestone-1 names above: the older
+# `ComparisonRule` / `ExecutionStatus` pipeline keeps working unchanged while
+# the two templates coexist.
+# ---------------------------------------------------------------------------
+
+
+class ExecutionScope(StrEnum):
+    """Which database sides one test needs. Nothing else is ever opened."""
+
+    SOURCE_TARGET = "SOURCE_TARGET"
+    SOURCE_ONLY = "SOURCE_ONLY"
+    TARGET_ONLY = "TARGET_ONLY"
+
+    @property
+    def uses_source(self) -> bool:
+        return self is not ExecutionScope.TARGET_ONLY
+
+    @property
+    def uses_target(self) -> bool:
+        return self is not ExecutionScope.SOURCE_ONLY
+
+
+class ComparisonType(StrEnum):
+    """The comparisons the workbook may ask for.
+
+    Every member maps to one Python function in
+    :mod:`~migration_reconciliation.evaluation.comparisons`. A workbook can
+    select a comparison; it can never define one.
+    """
+
+    EQUAL = "EQUAL"
+    EQUAL_ABS_TOLERANCE = "EQUAL_ABS_TOLERANCE"
+    EQUAL_PCT_TOLERANCE = "EQUAL_PCT_TOLERANCE"
+    EXPECTED_EQUAL = "EXPECTED_EQUAL"
+    EXPECTED_ZERO = "EXPECTED_ZERO"
+    LESS_THAN_OR_EQUAL = "LESS_THAN_OR_EQUAL"
+    GREATER_THAN_OR_EQUAL = "GREATER_THAN_OR_EQUAL"
+    NON_ZERO = "NON_ZERO"
+    BOOLEAN_TRUE = "BOOLEAN_TRUE"
+    TEXT_CASE_INSENSITIVE_EQUAL = "TEXT_CASE_INSENSITIVE_EQUAL"
+    NO_COMPARISON = "NO_COMPARISON"
+
+
+class ResultType(StrEnum):
+    """How a raw driver value is normalized before it is compared."""
+
+    INTEGER = "INTEGER"
+    NUMBER = "NUMBER"
+    TEXT = "TEXT"
+    BOOLEAN = "BOOLEAN"
+    DATETIME = "DATETIME"
+
+
+class TestStatus(StrEnum):
+    """The small, stable status set written to ``Status``.
+
+    Specific reasons live in ``Error_Code`` and the platform, never in extra
+    statuses: a report that filters on eight values stays readable, and a new
+    failure mode never needs a new status.
+    """
+
+    PASS = "PASS"
+    FAIL = "FAIL"
+    PROFILED = "PROFILED"
+    ERROR = "ERROR"
+    BLOCKED = "BLOCKED"
+    CONFIG_ERROR = "CONFIG ERROR"
+    NOT_EXECUTED = "NOT EXECUTED"
+    DISABLED = "DISABLED"
+
+
+class Platform(StrEnum):
+    """Where a status was decided. Half of the observation matching key."""
+
+    SOURCE = "SOURCE"
+    TARGET = "TARGET"
+    COMPARISON = "COMPARISON"
+    WORKBOOK = "WORKBOOK"
+    PROFILE = "PROFILE"
+    EXECUTOR = "EXECUTOR"
+    NONE = ""
+
+
+class ErrorCode(StrEnum):
+    """Stable internal reasons. Filterable, translatable, and never prose."""
+
+    # Profile / configuration
+    INVALID_PROFILE = "INVALID_PROFILE"
+    FORBIDDEN_SECRET_KEY = "FORBIDDEN_SECRET_KEY"
+    UNSUPPORTED_PROFILE_VERSION = "UNSUPPORTED_PROFILE_VERSION"
+    UNSUPPORTED_TEMPLATE_VERSION = "UNSUPPORTED_TEMPLATE_VERSION"
+    MISSING_CREDENTIALS = "MISSING_CREDENTIALS"
+    MISSING_SOURCE_SECTION = "MISSING_SOURCE_SECTION"
+    MISSING_TARGET_SECTION = "MISSING_TARGET_SECTION"
+    UNEXPECTED_SOURCE_SECTION = "UNEXPECTED_SOURCE_SECTION"
+    UNEXPECTED_TARGET_SECTION = "UNEXPECTED_TARGET_SECTION"
+
+    # Test definition
+    MISSING_TEST_ID = "MISSING_TEST_ID"
+    DUPLICATE_TEST_ID = "DUPLICATE_TEST_ID"
+    INVALID_ENABLED = "INVALID_ENABLED"
+    INVALID_SCOPE = "INVALID_SCOPE"
+    INVALID_COMPARISON_TYPE = "INVALID_COMPARISON_TYPE"
+    INVALID_RESULT_TYPE = "INVALID_RESULT_TYPE"
+    INVALID_TOLERANCE = "INVALID_TOLERANCE"
+    MISSING_SOURCE_SQL = "MISSING_SOURCE_SQL"
+    MISSING_TARGET_SQL = "MISSING_TARGET_SQL"
+    UNEXPECTED_SOURCE_SQL = "UNEXPECTED_SOURCE_SQL"
+    UNEXPECTED_TARGET_SQL = "UNEXPECTED_TARGET_SQL"
+    MISSING_EXPECTED_VALUE = "MISSING_EXPECTED_VALUE"
+    UNSAFE_SQL = "UNSAFE_SQL"
+
+    # Execution
+    CONNECTION_FAILED = "CONNECTION_FAILED"
+    QUERY_TIMEOUT = "QUERY_TIMEOUT"
+    QUERY_EXECUTION_FAILED = "QUERY_EXECUTION_FAILED"
+    NON_SCALAR_RESULT = "NON_SCALAR_RESULT"
+    NULL_RESULT = "NULL_RESULT"
+    TYPE_CONVERSION_ERROR = "TYPE_CONVERSION_ERROR"
+    RUN_STOPPED = "RUN_STOPPED"
+    DRY_RUN = "DRY_RUN"
+    UNEXPECTED_ERROR = "UNEXPECTED_ERROR"
+
+    # Comparison
+    VALUE_MISMATCH = "VALUE_MISMATCH"
+    TOLERANCE_EXCEEDED = "TOLERANCE_EXCEEDED"
+    PERCENTAGE_TOLERANCE_EXCEEDED = "PERCENTAGE_TOLERANCE_EXCEEDED"
+    ZERO_SOURCE_BASELINE = "ZERO_SOURCE_BASELINE"
+    EXPECTED_ZERO_FAILED = "EXPECTED_ZERO_FAILED"
+    THRESHOLD_EXCEEDED = "THRESHOLD_EXCEEDED"
+    NON_ZERO_FAILED = "NON_ZERO_FAILED"
+    BOOLEAN_NOT_TRUE = "BOOLEAN_NOT_TRUE"
+
+    # Workbook / output
+    WORKBOOK_READ_FAILED = "WORKBOOK_READ_FAILED"
+    OUTPUT_WRITE_FAILED = "OUTPUT_WRITE_FAILED"

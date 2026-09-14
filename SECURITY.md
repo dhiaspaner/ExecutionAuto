@@ -177,3 +177,33 @@ be committed by accident.
 If you find a way to make this framework connect somewhere it should not, execute
 something that is not a read-only query, or emit a credential into a file, log or
 cell, report it to the project owner before opening a pull request.
+
+---
+
+## 11. The reconciliation template
+
+The TOML-driven template adds three rules of its own.
+
+**Connections come from TOML and nowhere else.** The workbook's `Connections`
+sheet is an *example* of that file, kept beside the tests so their shape is
+visible. It is never parsed. Neither are `Executor Contract` or
+`Conversion Notes`: no instruction, action or connection setting is taken from
+any sheet.
+
+**Secret-like keys are refused at any depth.** `password`, `pwd`, `passwd`,
+`secret`, `token`, `access_token`, `api_key`, `client_secret`,
+`connection_string` and their relatives are rejected wherever they appear in
+the profile — including inside nested tables and arrays — with
+`FORBIDDEN_SECRET_KEY`. Comparison ignores case, underscores and hyphens, so
+`API-Key` and `api_key` are the same key. A *value* of `"password"` for
+`authentication` is fine: it names a mode, not a credential.
+
+**`Require_Read_Only_SQL` cannot be switched off from the workbook.** A run
+control sheet may say `No`; the run warns and enforces read-only validation
+anyway. A security requirement is not a spreadsheet setting. Read-only database
+accounts remain mandatory regardless — the SQL guard is a safety net, as section
+9 explains.
+
+No evidence file is written. `Evidence_Path` stays blank and
+`Evidence_Directory_Env` is reserved, because the only thing there is to write
+would be query output, and this framework stores scalars alone.

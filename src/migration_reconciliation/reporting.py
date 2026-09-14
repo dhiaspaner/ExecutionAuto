@@ -9,10 +9,19 @@ from __future__ import annotations
 
 import contextlib
 import sys
+from typing import TYPE_CHECKING
 
 from .models import ConnectionIdentity, RunSummary
 
-__all__ = ["make_output_encoding_safe", "render_summary"]
+if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime only
+    from .execution.engine import RunReport
+
+__all__ = [
+    "make_output_encoding_safe",
+    "render_identity",
+    "render_run_report",
+    "render_summary",
+]
 
 RULE_WIDTH = 72
 
@@ -70,3 +79,36 @@ def render_identity(identity: ConnectionIdentity) -> str:
     if identity.product_version:
         parts.append(f"version={identity.product_version}")
     return "  " + " ".join(parts)
+
+
+def render_run_report(report: RunReport, *, no_output_note: str) -> list[str]:
+    """The per-test table and totals for a reconciliation-template run.
+
+    Deliberately the same shape as :func:`render_summary`: the two entry points
+    produce reports a person can read side by side.
+    """
+    lines = ["", f"Run {report.run_id} - {report.workbook_path.name}", "-" * RULE_WIDTH]
+    for outcome in report.outcomes:
+        platform = f" [{outcome.platform.value}]" if outcome.platform.value else ""
+        code = f" {outcome.error_code}" if outcome.error_code else ""
+        lines.append(
+            f"  {outcome.status.value:<12} {outcome.test_id:<14} "
+            f"row {outcome.row_number:<4}{platform}{code}  {outcome.observation}"
+        )
+    lines.append("-" * RULE_WIDTH)
+    lines.append(
+        f"  {report.passed} passed, {report.failed} failed, {report.profiled} profiled, "
+        f"{report.blocked_error} blocked/error, {report.not_executed} not executed, "
+        f"{report.disabled} disabled"
+    )
+    lines.append(f"  Overall: {report.overall_status} ({report.enabled_tests} enabled test(s))")
+    if report.output_path is not None:
+        lines.append(f"  Results written to: {report.output_path}")
+        if report.output_path != report.workbook_path:
+            lines.append(f"  Original workbook unchanged: {report.workbook_path}")
+    else:
+        lines.append(no_output_note)
+    if report.overall_status != "PASS":
+        lines.append("")
+        lines.append("  Review every row above that is not PASS before signing off the migration.")
+    return lines

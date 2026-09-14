@@ -12,15 +12,163 @@ original is never modified.
 New domains, entities and templates are added by editing Excel and TOML. They do
 not require a Python change.
 
-There are two ways to run it:
+There are three ways to run it:
 
 | Entry point | What it does |
 | --- | --- |
-| `reconcile` | The offline command. Schema-driven, with scripted results from a TOML file and no database at all. Use it to validate a workbook or rehearse a run. |
-| `run_reconciliation.py` | The interactive runner. Asks fifteen questions, connects to a real source and target, and executes the workbook. |
+| `reconcile run` | **The reconciliation template.** A TOML profile holds the connections; the workbook's `Test Cases`, `Run Control` and `Observation Rules` sheets hold everything else. Start here. |
+| `reconcile execute` | The offline command. Schema-driven, with scripted results from a TOML file and no database at all. Use it to validate a workbook or rehearse a run. |
+| `run_reconciliation.py` | The original interactive runner. Asks fifteen questions, connects to a real source and target, and executes a fixed-column workbook. |
 
 > Neither one accepts a password as an argument, reads a credential from a file
 > or an environment variable, or writes one anywhere. See [SECURITY.md](SECURITY.md).
+
+---
+
+## Quick start: the reconciliation template
+
+```bash
+# 1. Get a workbook whose columns match this executor exactly.
+uv run reconcile make-workbook Payments.xlsx
+
+# 2. Copy the profile and point it at your servers. It never holds a password.
+cp config/reconciliation_profile.example.toml run_profile.toml
+
+# 3. Validate everything without opening a database.
+uv run reconcile run --profile run_profile.toml --dry-run
+
+# 4. Run it.
+uv run reconcile run --profile run_profile.toml
+```
+
+The profile is the only place a connection is configured:
+
+```toml
+version = "1.0"
+
+[workbook]
+path = "C:/Users/PC/Downloads/Payments.xlsx"
+sheet = "Test Cases"
+
+[source]
+type = "sqlserver"
+server = "localhost"
+port = 1433
+authentication = "windows"
+trust_server_certificate = true
+database = "webservice"
+
+[target]
+type = "sqlserver"
+server = "localhost"
+port = 1433
+database = "PaymentRecon_Target_Local"
+trust_server_certificate = true
+authentication = "windows"
+```
+
+Every key is optional: what is missing is asked for, one question at a time.
+Under `--non-interactive` nothing is asked, so everything needed must be there.
+
+**A profile never contains a password.** Any key that looks like a secret —
+`password`, `pwd`, `secret`, `token`, `access_token`, `api_key` and their
+relatives — is rejected at any depth in the file rather than ignored. Under
+`authentication = "password"` the username lives in TOML and the password is
+typed at runtime behind a hidden prompt, held in memory for the run, and never
+written to a file, a log or the workbook.
+
+### Who decides what
+
+| Source | Decides |
+| --- | --- |
+| The TOML profile | Workbook location, and every database connection. |
+| `Test Cases` | Queries, scopes, comparisons, tolerances, expected values. |
+| `Run Control` | Timeout, output mode, truncation, dry run, error handling. |
+| `Observation Rules` | The **wording** of an outcome. Never the outcome. |
+| `Comparison Types` | Documentation and validation metadata only. |
+| `Executor Contract`, `Conversion Notes`, `Connections` | Documentation only — never parsed for instructions, actions or connection settings. |
+
+### Execution scopes
+
+`Execution_Scope` decides which databases are opened at all.
+
+| Scope | Requires | Must be blank | Opens |
+| --- | --- | --- | --- |
+| `SOURCE_TARGET` | `Source_Profile_Section`, `Source_SQL`, `Target_Profile_Section`, `Target_SQL` | — | `[source]` and `[target]` |
+| `SOURCE_ONLY` | `Source_Profile_Section`, `Source_SQL` | `Target_Profile_Section`, `Target_SQL` | `[source]` only |
+| `TARGET_ONLY` | `Target_Profile_Section`, `Target_SQL` | `Source_Profile_Section`, `Source_SQL` | `[target]` only |
+
+A workbook of `TARGET_ONLY` tests never asks a source question and never opens a
+source session. `Enabled = No` is stronger still: the row is marked `DISABLED`,
+runs nothing, needs no connection, and is not counted in any total.
+
+### Comparison types
+
+All eleven are Python functions in a fixed registry. A workbook selects one by
+name; it can never supply one, and no formula or expression from a spreadsheet
+is evaluated anywhere.
+
+| Type | Passes when |
+| --- | --- |
+| `EQUAL` | Source and target are equal after normalization. |
+| `EQUAL_ABS_TOLERANCE` | `abs(target - source) <= Absolute_Tolerance`. |
+| `EQUAL_PCT_TOLERANCE` | The percentage variance against the source is within `Percentage_Tolerance`. |
+| `EXPECTED_EQUAL` | The executed value equals `Expected_Value`. |
+| `EXPECTED_ZERO` | The executed value is zero. |
+| `LESS_THAN_OR_EQUAL` | The executed value is at most `Expected_Value`. |
+| `GREATER_THAN_OR_EQUAL` | The executed value is at least `Expected_Value`. |
+| `NON_ZERO` | The executed value is not zero. |
+| `BOOLEAN_TRUE` | The executed value is TRUE. |
+| `TEXT_CASE_INSENSITIVE_EQUAL` | Text matches ignoring case. |
+| `NO_COMPARISON` | Never passes — records the value as `PROFILED`. |
+
+When the source is zero, `EQUAL_PCT_TOLERANCE` passes only if the target is zero
+too. Anything else needs an `Absolute_Tolerance` saying explicitly how much
+drift from nothing is acceptable; otherwise it fails with
+`ZERO_SOURCE_BASELINE` rather than dividing by zero or guessing.
+
+Under `SOURCE_TARGET`, a one-sided comparison such as `EXPECTED_ZERO` is applied
+to **both** executed values and both must satisfy it. Asserting on one of two
+executed values would let the other fail unread.
+
+### Statuses and error codes
+
+Eight statuses, and never more: `PASS`, `FAIL`, `PROFILED`, `ERROR`, `BLOCKED`,
+`CONFIG ERROR`, `NOT EXECUTED`, `DISABLED`. The specific reason lives in
+`Error_Code` and the platform that decided it, so a new failure mode never needs
+a new status:
+
+```text
+Status = ERROR         Platform = TARGET      Error_Code = QUERY_TIMEOUT
+Status = CONFIG ERROR  Platform = WORKBOOK    Error_Code = MISSING_SOURCE_SQL
+Status = FAIL          Platform = COMPARISON  Error_Code = VALUE_MISMATCH
+```
+
+A run is never reported as an overall `PASS` while an enabled test is still
+`NOT EXECUTED`.
+
+### Observations
+
+Wording is selected deterministically from `(Status, Platform, Error_Code)`:
+exact match, then `(status, platform, ANY)`, then `(status, ANY, error_code)`,
+then `(status, ANY, ANY)`, then the built-in Python fallback. There is no
+priority column, and two enabled rules matching the same key are rejected when
+the sheet is read. Templates may use controlled placeholders such as
+`{test_id}`, `{source_result}`, `{variance}` and `{timeout_seconds}`; only known
+names are replaced, and nothing is evaluated.
+
+### What a run writes
+
+The executor updates only the execution-output columns —
+`Source_Result`, `Target_Result`, `Actual_Value`, `Variance`,
+`Variance_Percentage`, `Status`, `Observation`, `Source_Duration_ms`,
+`Target_Duration_ms`, `Executed_At_UTC`, `Run_ID`, `Error_Code`, `Error_Detail`,
+`Evidence_Path` — plus one appended `Run History` row. Definition columns are
+never modified. Formatting, formulas, validation and unrelated sheets are
+preserved. The save goes to a temporary file in the destination folder and is
+moved into place only once it has succeeded, so a crash cannot leave a
+half-written workbook. Under the default `Output_Mode = NEW_FILE` the input
+workbook is left byte-for-byte as it was.
 
 ---
 
@@ -499,10 +647,14 @@ defence, not a replacement for permissions.
 ## Repository layout
 
 ```text
-run_reconciliation.py   The interactive runner: fifteen questions, two live databases
-config/                 Workbook schema DSL, plus the run-profile template
+run_reconciliation.py   The original interactive runner: fifteen questions, two live databases
+config/                 Run profiles (both templates) and the workbook schema DSL
 templates/              A generated example workbook matching the example schema
 src/                    The framework (see ARCHITECTURE.md)
-tests/                  Offline unit tests; tests/integration is an opt-in placeholder
+  execution/            Planning and running the reconciliation template
+  workbook/             Sheet readers, the comparison-safe writer, template generation
+  evaluation/           Result normalization and the comparison registry
+  database/             Adapters, connection settings and failure classification
+tests/                  Offline unit tests; tests/integration is opt-in and never automatic
 AGENTS.md               Mandatory rules for anyone (human or agent) changing this repo
 ```

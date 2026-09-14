@@ -269,3 +269,60 @@ src/migration_reconciliation/
     ├── sql_guard.py     Conservative read-only SQL validation
     └── redaction.py     Credential masking for all output
 ```
+
+---
+
+## The reconciliation template pipeline
+
+A second, self-contained pipeline runs the TOML-driven reconciliation template.
+It shares the security layer, the database adapters and the console reporting
+with the schema-DSL pipeline, and shares nothing else.
+
+```text
+reconcile run
+ |
+ |-- profile.load_profile            TOML: workbook location + connections only
+ |                                   Secret-like keys are refused at any depth.
+ |
+ |-- execution.plan.build_plan       Opens the workbook READ-ONLY
+ |     |-- workbook.run_control       Run Control -> how the run behaves
+ |     |-- workbook.testcases         Test Cases  -> what the tests are
+ |     |     |-- security.sql_guard      each query is read-only, single statement
+ |     |     |-- evaluation.comparisons  scope/comparison/result-type agreement
+ |     |     '-- evaluation.normalization  Expected_Value reads as its type
+ |     |-- workbook.observations      Observation Rules -> wording only
+ |     '-- (Comparison Types read as metadata; documentation sheets ignored)
+ |
+ |-- execution.connections           Only the sections the plan needs
+ |     |-- resolve_section_settings    TOML first, then one question at a time
+ |     |                               password via getpass, memory only
+ |     '-- SectionExecutors            one session per section, shared by all tests
+ |
+ |-- execution.engine.execute_plan
+ |     |-- execute_scalar per required side, each with its own timeout
+ |     |-- evaluation.normalization  raw scalar -> declared Result_Type
+ |     |-- evaluation.comparisons    a registered Python function decides
+ |     |-- status + error code       from the comparison, never from the workbook
+ |     '-- workbook.observations     wording for a decision already made
+ |
+ '-- workbook.output.ResultWriter    Opens a WRITABLE copy
+       |-- clear stale outputs, write output columns only
+       |-- append one Run History row
+       '-- save to a temp file, then os.replace into position
+```
+
+Two passes over the workbook is deliberate. The read pass uses
+`data_only=True`, which resolves cached formula values but would discard the
+formulas on save; the write pass keeps formulas, formatting and validation
+intact. The file being validated is therefore never the file being modified.
+
+### Invariants
+
+* A workbook can select behaviour. It can never define it: no formula,
+  expression or action from a sheet is evaluated anywhere.
+* `Execution_Scope` decides which sections are opened, and nothing outside that
+  set is connected to.
+* Observation rules describe a status Python has already decided.
+* Only execution-output columns and `Run History` are ever written.
+* No password reaches TOML, Excel, a log or an exception message.
+

@@ -49,10 +49,12 @@ username = "recon_reader"            # omit under Windows authentication
 # trust_server_certificate = true    # SQL Server sources only
 
 # ---------------------------------------------------------------------------
-# The migrated system being reconciled TO. Always SQL Server, so there is no
-# `type` key here.
+# The migrated system being reconciled TO. State the engine explicitly: if
+# `type` is missing it is inherited from [source] for backward compatibility,
+# and a warning says so.
 # ---------------------------------------------------------------------------
 [target]
+type = "sqlserver"
 server = "sql-mig-01.corp.local"
 port = 1433
 database = "PaymentsMigrated"

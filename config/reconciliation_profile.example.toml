@@ -1,0 +1,67 @@
+# Run profile for the reconciliation workbook template.
+#
+#     uv run reconcile run --profile config/reconciliation_profile.example.toml
+#
+# This file is the ONLY source of database connections. The workbook holds the
+# queries and the comparisons; it holds no server, no database and no login.
+# The `Connections` sheet inside the workbook is an example of this file, and is
+# never read.
+#
+# ---------------------------------------------------------------------------
+# THIS FILE MUST NEVER CONTAIN A PASSWORD.
+# ---------------------------------------------------------------------------
+# Any key that looks like a secret — password, pwd, secret, token, access_token,
+# api_key and their relatives — is REJECTED at any depth, not quietly ignored,
+# so a mistake is loud rather than silent.
+#
+# Two ways to avoid typing a password at all:
+#
+#   authentication = "windows"   Connects as the account already signed in to
+#                                Windows. Nothing is typed, stored or sent.
+#                                SQL Server only.
+#
+#   authentication = "password"  The username lives here; the password is typed
+#                                at runtime behind a hidden prompt, kept in
+#                                memory for the run, and written nowhere.
+#
+# Every key below is optional. Whatever is here is used and echoed on screen;
+# whatever is missing is asked for, one question at a time. Under
+# --non-interactive nothing is asked, so every needed key must be present.
+
+version = "1.0"
+
+[workbook]
+# Absolute path, or relative to wherever the command is run from.
+# On Windows either "C:/Users/PC/Downloads/Payments.xlsx" or a doubled
+# backslash form works.
+path = "C:/Users/PC/Downloads/Payments.xlsx"
+# The sheet holding the test cases. Defaults to "Test Cases".
+sheet = "Test Cases"
+
+# ---------------------------------------------------------------------------
+# The system being reconciled FROM. Opened only when an enabled test has
+# Execution_Scope = SOURCE_TARGET or SOURCE_ONLY.
+# ---------------------------------------------------------------------------
+[source]
+type = "sqlserver"                   # "sqlserver" or "oracle"
+server = "localhost"
+port = 1433                          # omit to accept 1433 for SQL Server, 1521 for Oracle
+authentication = "windows"           # "windows" (SQL Server only) or "password"
+trust_server_certificate = true      # true when the certificate is not already trusted
+database = "webservice"              # the SERVICE NAME when type = "oracle"
+# username = "recon_reader"          # required when authentication = "password"
+
+# ---------------------------------------------------------------------------
+# The migrated system being reconciled TO. Opened only when an enabled test has
+# Execution_Scope = SOURCE_TARGET or TARGET_ONLY.
+# ---------------------------------------------------------------------------
+[target]
+# State the engine explicitly. If this key is missing it is inherited from
+# [source] for backward compatibility, and a warning says so.
+type = "sqlserver"
+server = "localhost"
+port = 1433
+database = "PaymentRecon_Target_Local"
+trust_server_certificate = true
+authentication = "windows"
+# username = "svc_recon"             # required when authentication = "password"

@@ -25,10 +25,17 @@ from pathlib import Path
 from .database.factory import create_executor_factory, real_adapters_available
 from .database.fake import load_fake_results
 from .errors import ReconciliationError
+from .execution.connections import SectionExecutors, resolve_section_settings
+from .execution.engine import RunReport, execute_plan, new_run_id
+from .execution.plan import ExecutionPlan, build_plan
 from .models import RunSummary, WorkbookSchema
-from .reporting import make_output_encoding_safe, render_summary
+from .profile import RunProfile, load_profile
+from .reporting import make_output_encoding_safe, render_run_report, render_summary
 from .runner import ReconciliationRunner, RunOptions
 from .security.redaction import sanitize_error
+from .wizard import Prompter
+from .workbook.columns import TEST_CASES_SHEET
+from .workbook.payments_template import write_workbook
 from .workbook.reader import validate_workbook
 from .workbook.schema import load_schema
 from .workbook.template import write_template
@@ -41,7 +48,7 @@ EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
 PROGRAM = "reconcile"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -129,6 +136,67 @@ def build_parser() -> argparse.ArgumentParser:
     test_connections.add_argument("workbook", type=Path, help="Workbook to inspect.")
     test_connections.set_defaults(handler=_cmd_test_connections)
 
+    run = subparsers.add_parser(
+        "run",
+        help=("Run a reconciliation workbook against the databases named in a TOML profile."),
+    )
+    run.add_argument(
+        "--profile",
+        required=True,
+        type=Path,
+        metavar="PATH",
+        help=(
+            "TOML profile holding the workbook location and the database connections. "
+            "It never contains a password."
+        ),
+    )
+    run.add_argument(
+        "--workbook",
+        type=Path,
+        metavar="PATH",
+        help="Workbook to run, overriding [workbook] path in the profile.",
+    )
+    run.add_argument(
+        "--sheet",
+        metavar="NAME",
+        help=f"Test-case sheet, overriding [workbook] sheet (default: {TEST_CASES_SHEET}).",
+    )
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate everything and open nothing. Runs no reconciliation SQL.",
+    )
+    run.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Never prompt. Every required value must be in the profile, and every "
+            'connection must use authentication = "windows".'
+        ),
+    )
+    run.add_argument(
+        "--output-dir",
+        type=Path,
+        metavar="PATH",
+        help="Directory for the result workbook (default: next to the input).",
+    )
+    run.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Run and report without producing a result workbook.",
+    )
+    run.set_defaults(handler=_cmd_run)
+
+    make_workbook = subparsers.add_parser(
+        "make-workbook",
+        help="Generate a reconciliation workbook matching this executor's template.",
+    )
+    make_workbook.add_argument("output", type=Path, help="Path of the workbook to create.")
+    make_workbook.add_argument(
+        "--force", action="store_true", help="Allow overwriting an existing file."
+    )
+    make_workbook.set_defaults(handler=_cmd_make_workbook)
+
     make_template = subparsers.add_parser(
         "make-template",
         parents=[schema_parent],
@@ -205,6 +273,125 @@ def _cmd_execute(args: argparse.Namespace) -> int:
     summary = ReconciliationRunner(schema, factory).run(args.workbook, options)
     _report(summary)
     return EXIT_OK if summary.is_clean else EXIT_FAILURES
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    """The reconciliation-template workflow, in the order the contract fixes.
+
+    Nothing is opened until every test definition has been validated and the
+    set of required connections is known, so a misconfigured workbook costs a
+    second rather than a round of failed logins.
+    """
+    profile = load_profile(args.profile)
+    for warning in profile.warnings:
+        _emit(f"  warning: {warning}")
+
+    prompter = Prompter()
+    workbook_path = _workbook_path(args, profile, prompter)
+    sheet_name = args.sheet or profile.sheet_name or TEST_CASES_SHEET
+
+    plan = build_plan(workbook_path, sheet_name=sheet_name)
+    if args.dry_run:
+        plan = ExecutionPlan(
+            workbook_path=plan.workbook_path,
+            sheet=plan.sheet,
+            control=plan.control.with_overrides(dry_run=True),
+            rules=plan.rules,
+            warnings=plan.warnings,
+            ignored_sheets=plan.ignored_sheets,
+        )
+    _report_plan(plan, workbook_path, sheet_name)
+
+    executors: SectionExecutors | None = None
+    if not plan.control.dry_run and plan.executable:
+        sections = plan.required_sections
+        if not sections:
+            raise ReconciliationError(
+                "No enabled test names a profile section, so there is nothing to connect to."
+            )
+        settings = resolve_section_settings(
+            profile,
+            sections,
+            prompter=prompter,
+            interactive=not args.non_interactive,
+        )
+        executors = SectionExecutors(settings)
+        _emit("")
+        _emit("Connecting...")
+        for section in sections:
+            _emit(f"  [{section}] {executors.describe(section)}")
+
+    report = execute_plan(
+        plan,
+        executors=executors,
+        run_id=new_run_id(),
+        output_dir=args.output_dir,
+        write_output=not args.no_write,
+    )
+    _report_run(report)
+    if report.dry_run:
+        # A dry run reports what a real run would do. Its own success is
+        # whether validation found anything, not whether tests would pass.
+        return EXIT_FAILURES if plan.problems else EXIT_OK
+    return EXIT_OK if report.is_clean else EXIT_FAILURES
+
+
+def _workbook_path(args: argparse.Namespace, profile: RunProfile, prompter: Prompter) -> Path:
+    """The workbook to run: the flag, then the profile, then a question."""
+    for candidate in (args.workbook, profile.workbook_path):
+        if candidate is not None:
+            path = Path(candidate).expanduser()
+            if path.is_file():
+                return path
+            raise ReconciliationError(f"Workbook not found: {path}")
+    if args.non_interactive:
+        raise ReconciliationError(
+            "No workbook was given. Set [workbook] path in the profile or pass --workbook."
+        )
+    prompter.set_total(1)
+    return prompter.existing_workbook("Path to the workbook (.xlsx)")
+
+
+def _report_plan(plan: ExecutionPlan, workbook_path: Path, sheet_name: str) -> None:
+    _emit(f"Workbook : {workbook_path}")
+    _emit(f"Sheet    : {plan.sheet.sheet_name} (headers on row {plan.sheet.header_row})")
+    _emit(
+        f"  enabled tests : {len(plan.executable)}   "
+        f"disabled: {len(plan.disabled)}   config errors: {len(plan.problems)}"
+    )
+    _emit(f"  connections   : {', '.join(plan.required_sections) or 'none required'}")
+    _emit(
+        f"  timeout       : {plan.control.query_timeout_seconds}s per query   "
+        f"output mode: {plan.control.output_mode.value}"
+        f"{'   DRY RUN' if plan.control.dry_run else ''}"
+    )
+    for warning in plan.warnings:
+        _emit(f"  warning: {warning}")
+    for problem in plan.problems:
+        _emit(
+            f"  CONFIG ERROR row {problem.row_number} "
+            f"[{problem.test_id or '?'}] {problem.code.value}: {problem.message}"
+        )
+
+
+def _report_run(report: RunReport) -> None:
+    note = (
+        "  Dry run: no result workbook was written and no results were cleared."
+        if report.dry_run
+        else "  No result workbook written (--no-write)."
+    )
+    for line in render_run_report(report, no_output_note=note):
+        _emit(line)
+
+
+def _cmd_make_workbook(args: argparse.Namespace) -> int:
+    try:
+        path = write_workbook(args.output, overwrite=args.force)
+    except FileExistsError as exc:
+        _error(f"{exc} Use --force to replace it.")
+        return EXIT_USAGE
+    _emit(f"Workbook written: {path}")
+    return EXIT_OK
 
 
 def _cmd_test_connections(args: argparse.Namespace) -> int:
