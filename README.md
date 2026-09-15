@@ -340,7 +340,7 @@ connects to nothing.
 
 ```powershell
 uv run reconcile validate-schema `
-    --schema ".\config\workbook_schema.default.toml"
+    --schema ".\config\workbook_schema.example.toml"
 ```
 
 This checks the schema version, the sheet geometry, that every mandatory
@@ -353,7 +353,7 @@ and that the output filename pattern cannot overwrite the input workbook.
 ```powershell
 uv run reconcile validate-template `
     ".\templates\reconciliation_template.xlsx" `
-    --schema ".\config\workbook_schema.default.toml"
+    --schema ".\config\workbook_schema.example.toml"
 ```
 
 This confirms the sheet exists, every required column is present, test-case ids
@@ -365,7 +365,7 @@ row is malformed, listing the row numbers.
 ```powershell
 uv run reconcile execute `
     ".\templates\reconciliation_template.xlsx" `
-    --schema ".\config\workbook_schema.default.toml" `
+    --schema ".\config\workbook_schema.example.toml" `
     --fake-results ".\tests\fixtures\fake_results.toml"
 ```
 
@@ -388,19 +388,19 @@ Useful variations:
 ```powershell
 # One named test case
 uv run reconcile execute ".\templates\reconciliation_template.xlsx" `
-    --schema ".\config\workbook_schema.default.toml" `
+    --schema ".\config\workbook_schema.example.toml" `
     --case "TC-PAY-008" `
     --fake-results ".\tests\fixtures\fake_results.toml"
 
 # A two-case pilot
 uv run reconcile execute ".\templates\reconciliation_template.xlsx" `
-    --schema ".\config\workbook_schema.default.toml" `
+    --schema ".\config\workbook_schema.example.toml" `
     --limit 2 `
     --fake-results ".\tests\fixtures\fake_results.toml"
 
 # Stop at the first problem, and put the output somewhere specific
 uv run reconcile execute ".\templates\reconciliation_template.xlsx" `
-    --schema ".\config\workbook_schema.default.toml" `
+    --schema ".\config\workbook_schema.example.toml" `
     --fail-fast --output-dir ".\out" `
     --fake-results ".\tests\fixtures\fake_results.toml"
 ```
@@ -432,7 +432,7 @@ No Python changes are needed — this is the point of the design.
 1. **Copy the shipped schema.**
 
    ```powershell
-   Copy-Item .\config\workbook_schema.default.toml .\config\fines_schema.toml
+   Copy-Item .\config\workbook_schema.example.toml .\config\fines_schema.toml
    ```
 
 2. **Point it at your sheet.**
@@ -763,7 +763,10 @@ defence, not a replacement for permissions.
 
 ```text
 run_reconciliation.py   The original interactive runner: fifteen questions, two live databases
-config/                 Run profiles (both templates) and the workbook schema DSL
+config/                 Run profiles, and the two workbook schema DSL files:
+                        workbook_schema.example.toml  the shipped template, and
+                                                      the one to copy for a new one
+                        workbook_schema.default.toml  the payments v1 workbook
 templates/              A generated example workbook matching the example schema
 src/                    The framework (see ARCHITECTURE.md)
   execution/            Planning and running the reconciliation template
