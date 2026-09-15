@@ -13,6 +13,8 @@ from migration_reconciliation.errors import (
     DatabaseExecutionError,
     NonScalarResultError,
     QueryTimeoutError,
+    SqlSyntaxError,
+    SyntaxCheckUnavailableError,
 )
 from migration_reconciliation.execution.engine import RunReport, execute_plan
 from migration_reconciliation.execution.plan import ExecutionPlan, build_plan
@@ -520,3 +522,255 @@ def test_only_the_sections_the_plan_needs_are_ever_opened(
     assert plan.required_sections == ("target",)
     assert executors.opened == ["target"]
     assert executors.sections == ("target",)
+
+
+# -- pass 1: validation, and the gate it guards ------------------------------
+
+
+def syntax_error(message: str) -> SqlSyntaxError:
+    return SqlSyntaxError(message)
+
+
+def test_every_enabled_query_is_validated_before_any_of_them_is_executed(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001"), test_row("TC-002")])
+    executors = ScriptedExecutors(results={"source": 1, "target": 1})
+
+    run(path, executors)
+
+    # Four checks, then four executions: not one query runs while another is
+    # still unvalidated.
+    assert len(executors.checks) == 4
+    assert len(executors.calls) == 4
+    assert executors.checks[-1].timeout_seconds == executors.calls[0].timeout_seconds
+    assert [check.sql for check in executors.checks] == [call.sql for call in executors.calls]
+
+
+def test_the_validation_pass_uses_the_configured_timeout(
+    make_recon_workbook: Any, test_row: Any, run_control_settings: Any
+) -> None:
+    path = make_recon_workbook(
+        [test_row("TC-001")], run_control=run_control_settings(Query_Timeout_Seconds=45)
+    )
+    executors = ScriptedExecutors(results={"source": 1, "target": 1})
+
+    run(path, executors)
+
+    assert {check.timeout_seconds for check in executors.checks} == {45}
+
+
+def test_sql_the_database_refuses_to_compile_is_reported_as_a_syntax_error(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001")])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={("source", SOURCE_SQL): syntax_error("ORA-00904: invalid identifier")},
+    )
+
+    report = run(path, executors)
+
+    outcome = outcome_of(report, "TC-001")
+    assert outcome.status is TestStatus.SYNTAX_ERROR
+    assert outcome.error_code == ErrorCode.SYNTAX_ERROR.value
+    assert outcome.platform is Platform.SOURCE
+    assert "invalid identifier" in outcome.error_detail
+
+
+def test_a_syntax_error_leaves_the_result_columns_empty(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001")])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={
+            ("target", TARGET_SQL): syntax_error("Invalid object name 'dbo.Paymnets'")
+        },
+    )
+
+    outcome = outcome_of(run(path, executors), "TC-001")
+
+    assert outcome.source_result is None
+    assert outcome.target_result is None
+    assert outcome.actual_value is None
+    assert outcome.variance is None
+
+
+def test_one_broken_query_stops_every_other_test_from_executing(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001"), test_row("TC-002"), test_row("TC-003")])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={("source", SOURCE_SQL): syntax_error("ORA-00942: table does not exist")},
+    )
+
+    report = run(path, executors)
+
+    assert not executors.executed_anything()
+    assert report.stopped_by_validation
+    # Every row was validated; the broken SQL is shared, so all three are named.
+    assert report.syntax_errors == 3
+
+
+def test_the_rows_that_validated_are_recorded_as_not_executed(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    broken = test_row("TC-BAD", Source_SQL="SELECT COUNT(*) FROM Paymnets")
+    path = make_recon_workbook([test_row("TC-OK"), broken])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={
+            ("source", "SELECT COUNT(*) FROM Paymnets"): syntax_error("Invalid object name")
+        },
+    )
+
+    report = run(path, executors)
+
+    assert outcome_of(report, "TC-BAD").status is TestStatus.SYNTAX_ERROR
+    good = outcome_of(report, "TC-OK")
+    assert good.status is TestStatus.NOT_EXECUTED
+    assert good.error_code == ErrorCode.RUN_STOPPED.value
+    assert "pre-execution SQL check" in good.error_detail
+    assert "TC-BAD" in good.error_detail
+    assert not executors.executed_anything()
+
+
+def test_a_validation_failure_is_never_an_overall_pass(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001")])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={("source", SOURCE_SQL): syntax_error("ORA-00933")},
+    )
+
+    report = run(path, executors)
+
+    assert report.overall_status == "ERROR"
+    assert not report.is_clean
+    assert report.blocked_error == 1
+
+
+def test_the_second_side_is_not_checked_once_the_first_has_failed(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001")])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={("source", SOURCE_SQL): syntax_error("ORA-00904")},
+    )
+
+    run(path, executors)
+
+    assert executors.checked_sql_for("source") == [SOURCE_SQL]
+    assert executors.checked_sql_for("target") == []
+
+
+def test_a_clean_validation_pass_runs_everything(make_recon_workbook: Any, test_row: Any) -> None:
+    path = make_recon_workbook([test_row("TC-001"), test_row("TC-002")])
+    executors = ScriptedExecutors(results={"source": 7, "target": 7})
+
+    report = run(path, executors)
+
+    assert not report.stopped_by_validation
+    assert report.passed == 2
+    assert len(executors.calls) == 4
+
+
+def test_a_dead_connection_blocks_its_own_rows_without_closing_the_gate(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-BOTH"), target_only_row(test_row)])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 0},
+        connect_failures={"source": "login failed"},
+    )
+
+    report = run(path, executors)
+
+    assert outcome_of(report, "TC-BOTH").status is TestStatus.BLOCKED
+    # The target-only test was validated and then executed: a source that never
+    # opened says nothing about the target's SQL.
+    assert outcome_of(report, "TC-TGT").status is TestStatus.PASS
+    assert executors.checked_sql_for("source") == []
+    assert executors.checked_sql_for("target") == [TARGET_SQL]
+
+
+def test_a_check_that_cannot_be_made_warns_instead_of_condemning_the_sql(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001"), test_row("TC-002")])
+    executors = ScriptedExecutors(
+        results={"source": 5, "target": 5},
+        syntax_failures={
+            ("source", SOURCE_SQL): SyntaxCheckUnavailableError("the server refused SET NOEXEC ON")
+        },
+    )
+
+    report = run(path, executors)
+
+    assert report.passed == 2
+    assert not report.stopped_by_validation
+    warnings = [w for w in report.warnings if "not validated" in w]
+    # One warning for the section, however many of its queries went unchecked.
+    assert len(warnings) == 1
+    assert "[source]" in warnings[0]
+
+
+def test_a_timeout_during_validation_stops_the_run_without_claiming_a_syntax_error(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001")])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={("source", SOURCE_SQL): QueryTimeoutError("took too long")},
+    )
+
+    report = run(path, executors)
+
+    outcome = outcome_of(report, "TC-001")
+    assert outcome.status is TestStatus.ERROR
+    assert outcome.error_code == ErrorCode.QUERY_TIMEOUT.value
+    assert report.stopped_by_validation
+    assert not executors.executed_anything()
+
+
+def test_an_unexpected_failure_during_validation_is_named_as_such(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001")])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={("source", SOURCE_SQL): DatabaseExecutionError("driver gave up")},
+    )
+
+    outcome = outcome_of(run(path, executors), "TC-001")
+
+    assert outcome.status is TestStatus.ERROR
+    assert outcome.error_code == ErrorCode.SYNTAX_CHECK_FAILED.value
+
+
+def test_a_dry_run_validates_nothing_against_a_database(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001")])
+    executors = ScriptedExecutors(results={"source": 1, "target": 1})
+
+    report = run(path, executors, dry_run=True)
+
+    assert executors.checks == []
+    assert executors.calls == []
+    assert executors.opened == []
+    assert report.dry_run
+
+
+def test_a_disabled_row_is_never_validated(make_recon_workbook: Any, test_row: Any) -> None:
+    path = make_recon_workbook([test_row("TC-ON"), test_row("TC-OFF", Enabled="No")])
+    executors = ScriptedExecutors(results={"source": 1, "target": 1})
+
+    run(path, executors)
+
+    assert all("TC-OFF" not in check.sql for check in executors.checks)
+    assert len(executors.checks) == 2

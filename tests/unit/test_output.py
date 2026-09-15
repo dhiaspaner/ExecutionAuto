@@ -10,7 +10,7 @@ import pytest
 from openpyxl import load_workbook
 
 import migration_reconciliation.workbook.output as output_module
-from migration_reconciliation.errors import WorkbookError
+from migration_reconciliation.errors import SqlSyntaxError, WorkbookError
 from migration_reconciliation.execution.engine import execute_plan
 from migration_reconciliation.execution.plan import ExecutionPlan, build_plan
 from migration_reconciliation.workbook.output import ResultWriter, resolve_directory_env
@@ -32,6 +32,12 @@ def cells(path: Path, sheet_name: str = "Test Cases") -> dict[str, dict[str, Any
         return rows
     finally:
         workbook.close()
+
+
+def history_column(workbook: Any, header: str) -> int:
+    """Index of a ``Run History`` column, so a test never counts columns by hand."""
+    headers = [cell.value for cell in workbook["Run History"][1]]
+    return headers.index(header)
 
 
 def run_and_write(path: Path, executors: ScriptedExecutors, **kwargs: Any) -> Any:
@@ -381,3 +387,75 @@ def test_the_temporary_file_lives_beside_the_destination(
         writer.close()
 
     assert seen == [str(destination)]
+
+
+# -- what a stopped validation pass leaves behind -----------------------------
+
+
+def test_a_gated_run_writes_the_reasons_and_no_results(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    broken = test_row("TC-BAD", Source_SQL="SELECT COUNT(*) FROM Paymnets")
+    path = make_recon_workbook([test_row("TC-OK"), broken])
+    executors = ScriptedExecutors(
+        results={"source": 100, "target": 100},
+        syntax_failures={
+            ("source", "SELECT COUNT(*) FROM Paymnets"): SqlSyntaxError(
+                "Invalid object name 'Paymnets'"
+            )
+        },
+    )
+
+    report = run_and_write(path, executors)
+
+    written = cells(report.output_path)
+    assert written["TC-BAD"]["Status"] == "SYNTAX ERROR"
+    assert written["TC-BAD"]["Error_Code"] == "SYNTAX_ERROR"
+    assert "Paymnets" in written["TC-BAD"]["Error_Detail"]
+    assert written["TC-OK"]["Status"] == "NOT EXECUTED"
+    for test_id in ("TC-BAD", "TC-OK"):
+        assert written[test_id]["Source_Result"] is None, test_id
+        assert written[test_id]["Target_Result"] is None, test_id
+        assert written[test_id]["Variance"] is None, test_id
+    assert not executors.executed_anything()
+
+
+def test_a_gated_run_still_leaves_the_input_workbook_alone(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001")])
+    original = path.read_bytes()
+
+    report = run_and_write(
+        path,
+        ScriptedExecutors(
+            results={"source": 1, "target": 1},
+            syntax_failures={("source", test_row("TC-001")["Source_SQL"]): SqlSyntaxError("nope")},
+        ),
+    )
+
+    assert path.read_bytes() == original
+    assert report.output_path is not None and report.output_path != path
+
+
+def test_a_gated_run_appends_one_history_row_saying_nothing_passed(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001")])
+    report = run_and_write(
+        path,
+        ScriptedExecutors(
+            results={"source": 1, "target": 1},
+            syntax_failures={("source", test_row("TC-001")["Source_SQL"]): SqlSyntaxError("nope")},
+        ),
+    )
+
+    workbook = load_workbook(report.output_path)
+    try:
+        history = list(workbook["Run History"].iter_rows(min_row=2, values_only=True))
+        status_column = history_column(workbook, "Overall_Status")
+    finally:
+        workbook.close()
+
+    assert len(history) == 1
+    assert history[0][status_column] == "ERROR"

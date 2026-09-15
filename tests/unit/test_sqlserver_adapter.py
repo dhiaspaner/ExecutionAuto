@@ -10,7 +10,11 @@ import pytest
 from migration_reconciliation.database.base import QuerySide
 from migration_reconciliation.database.settings import ConnectionSettings
 from migration_reconciliation.database.sqlserver import PREFERRED_DRIVERS, SqlServerExecutor
-from migration_reconciliation.errors import DatabaseExecutionError
+from migration_reconciliation.errors import (
+    DatabaseExecutionError,
+    SqlSyntaxError,
+    SyntaxCheckUnavailableError,
+)
 from migration_reconciliation.models import DatabaseType
 from tests.drivers import FakeConnection, FakePyodbc, odbc_error
 
@@ -260,3 +264,125 @@ def test_a_missing_pyodbc_is_explained_rather_than_traced(monkeypatch: pytest.Mo
 
     with pytest.raises(DatabaseExecutionError, match="pyodbc is not installed"):
         executor.connect()
+
+
+# -- validating SQL without executing it --------------------------------------
+
+
+def test_validation_compiles_the_query_with_execution_switched_off() -> None:
+    driver = FakePyodbc()
+    executor = SqlServerExecutor(settings(), driver=driver)
+
+    executor.validate_syntax("SELECT COUNT(*) FROM dbo.Payments", 30)
+
+    assert driver.connection is not None
+    assert driver.connection.executed_sql == [
+        "SET NOEXEC ON",
+        "SELECT COUNT(*) FROM dbo.Payments",
+        "SET NOEXEC OFF",
+    ]
+    # Nothing was read: a compile is not a query.
+    assert driver.connection.fetch_sizes == []
+
+
+def test_validation_passes_the_sql_through_untranslated() -> None:
+    driver = FakePyodbc()
+    sql = "SELECT COUNT(*) FROM DXBPRODSQL02.webservice.dbo.Payments WITH (NOLOCK)"
+
+    SqlServerExecutor(settings(), driver=driver).validate_syntax(sql, 30)
+
+    assert driver.connection is not None
+    assert sql in driver.connection.executed_sql
+
+
+def test_a_query_the_server_rejects_is_a_syntax_error() -> None:
+    connection = FakeConnection(
+        values_by_sql={
+            "SELECT COUNT(*) FROM dbo.Paymnets": odbc_error(
+                "42S02", "Invalid object name 'dbo.Paymnets'."
+            )
+        }
+    )
+    executor = SqlServerExecutor(settings(), driver=FakePyodbc(connection=connection))
+
+    with pytest.raises(SqlSyntaxError, match="Invalid object name"):
+        executor.validate_syntax("SELECT COUNT(*) FROM dbo.Paymnets", 30)
+
+
+def test_execution_is_switched_back_on_even_when_the_query_is_rejected() -> None:
+    connection = FakeConnection(
+        values_by_sql={"SELECT bad syntax": odbc_error("42000", "Incorrect syntax near 'bad'.")}
+    )
+    executor = SqlServerExecutor(settings(), driver=FakePyodbc(connection=connection))
+
+    with pytest.raises(SqlSyntaxError):
+        executor.validate_syntax("SELECT bad syntax", 30)
+
+    assert connection.executed_sql[-1] == "SET NOEXEC OFF"
+
+
+def test_a_session_that_will_not_leave_noexec_is_closed_rather_than_reused() -> None:
+    connection = FakeConnection(
+        values_by_sql={"SET NOEXEC OFF": odbc_error("08S01", "Communication link failure")}
+    )
+    executor = SqlServerExecutor(settings(), driver=FakePyodbc(connection=connection))
+
+    with pytest.raises(SyntaxCheckUnavailableError, match="NOEXEC OFF"):
+        executor.validate_syntax("SELECT 1", 30)
+
+    assert connection.closed
+
+
+def test_a_server_that_refuses_noexec_reports_an_unavailable_check() -> None:
+    connection = FakeConnection(
+        values_by_sql={"SET NOEXEC ON": odbc_error("42000", "permission denied")}
+    )
+    executor = SqlServerExecutor(settings(), driver=FakePyodbc(connection=connection))
+
+    with pytest.raises(SyntaxCheckUnavailableError, match="SET NOEXEC ON"):
+        executor.validate_syntax("SELECT 1", 30)
+
+
+def test_a_connection_lost_mid_check_is_not_reported_as_bad_sql() -> None:
+    connection = FakeConnection(
+        values_by_sql={"SELECT 1": odbc_error("08S01", "Communication link failure")}
+    )
+    executor = SqlServerExecutor(settings(), driver=FakePyodbc(connection=connection))
+
+    with pytest.raises(SyntaxCheckUnavailableError):
+        executor.validate_syntax("SELECT 1", 30)
+
+
+def test_validation_applies_the_query_timeout() -> None:
+    driver = FakePyodbc()
+    SqlServerExecutor(settings(), driver=driver).validate_syntax("SELECT 1", 45)
+
+    assert driver.connection is not None
+    assert [cursor.timeout for cursor in driver.connection.cursors] == [45]
+
+
+def test_validation_closes_its_cursor() -> None:
+    driver = FakePyodbc()
+    SqlServerExecutor(settings(), driver=driver).validate_syntax("SELECT 1", 30)
+
+    assert driver.connection is not None
+    assert all(cursor.closed for cursor in driver.connection.cursors)
+
+
+def test_validation_refuses_a_timeout_of_zero() -> None:
+    executor = SqlServerExecutor(settings(), driver=FakePyodbc())
+
+    with pytest.raises(DatabaseExecutionError, match="greater than 0"):
+        executor.validate_syntax("SELECT 1", 0)
+
+
+def test_the_password_never_reaches_a_validation_failure() -> None:
+    connection = FakeConnection(
+        values_by_sql={"SELECT 1": odbc_error("42000", f"login used PWD={SECRET}")}
+    )
+    executor = SqlServerExecutor(settings(), driver=FakePyodbc(connection=connection))
+
+    with pytest.raises(SqlSyntaxError) as raised:
+        executor.validate_syntax("SELECT 1", 30)
+
+    assert SECRET not in str(raised.value)

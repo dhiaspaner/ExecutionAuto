@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..errors import DatabaseExecutionError, ReconciliationError
+from ..errors import DatabaseExecutionError, ReconciliationError, SqlSyntaxError
 from ..models import ConnectionIdentity, DatabaseType, ScalarValue
 from .base import QuerySide, single_scalar
 
@@ -39,6 +39,8 @@ _ALLOWED_CASE_KEYS = frozenset(
         "target_result",
         "source_error",
         "target_error",
+        "source_syntax_error",
+        "target_syntax_error",
         "source_row_count",
         "target_row_count",
         "source_column_count",
@@ -54,13 +56,21 @@ class FakeResponse:
 
     ``error`` wins over ``value``. ``row_count`` and ``column_count`` let a
     fixture reproduce the "query returned the wrong shape" condition that real
-    adapters must also reject.
+    adapters must also reject, and ``syntax_error`` reproduces a query the
+    database refuses to compile, which a run must find before it executes
+    anything.
     """
 
     value: ScalarValue = None
     error: str | None = None
+    syntax_error: str | None = None
     row_count: int = 1
     column_count: int = 1
+
+    def check(self, label: str) -> None:
+        """Raise if this query is scripted not to compile."""
+        if self.syntax_error is not None:
+            raise SqlSyntaxError(f"{label} was rejected before execution: {self.syntax_error}")
 
     def resolve(self, label: str) -> ScalarValue:
         if self.error is not None:
@@ -104,6 +114,8 @@ class FakeQueryExecutor:
         self.response = response
         #: Queries this executor was asked to run, for test assertions.
         self.executed_sql: list[str] = []
+        #: Queries this executor was asked to check, for test assertions.
+        self.validated_sql: list[str] = []
         self.closed = False
         self.close_count = 0
 
@@ -117,6 +129,16 @@ class FakeQueryExecutor:
             account_name="",
             product_version="fake-executor/1.0",
         )
+
+    def validate_syntax(self, sql: str, timeout_seconds: int) -> None:
+        """Answer from the script, and execute nothing whatever the answer is."""
+        self._assert_open()
+        if timeout_seconds <= 0:
+            raise DatabaseExecutionError(
+                f"Timeout must be greater than 0 seconds (got {timeout_seconds})"
+            )
+        self.validated_sql.append(sql)
+        self.response.check(label=f"{self.side.value.capitalize()} query")
 
     def execute_scalar(self, sql: str, timeout_seconds: int) -> ScalarValue:
         self._assert_open()
@@ -210,6 +232,9 @@ def _parse_response(
     error = entry.get(f"{prefix}_error")
     if error is not None and not isinstance(error, str):
         raise ReconciliationError(f"{source}: {where} {prefix}_error must be a string")
+    syntax_error = entry.get(f"{prefix}_syntax_error")
+    if syntax_error is not None and not isinstance(syntax_error, str):
+        raise ReconciliationError(f"{source}: {where} {prefix}_syntax_error must be a string")
     value = entry.get(f"{prefix}_result")
     if value is not None and not isinstance(value, str | int | float | bool):
         raise ReconciliationError(
@@ -218,6 +243,7 @@ def _parse_response(
     return FakeResponse(
         value=value,
         error=error,
+        syntax_error=syntax_error,
         row_count=_parse_count(entry, f"{prefix}_row_count", where, source),
         column_count=_parse_count(entry, f"{prefix}_column_count", where, source),
     )

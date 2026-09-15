@@ -99,11 +99,23 @@ def render_run_report(report: RunReport, *, no_output_note: str) -> list[str]:
             f"row {outcome.row_number:<4}{platform}{code}  {outcome.observation}"
         )
     lines.append("-" * RULE_WIDTH)
+    if report.stopped_by_validation:
+        lines.append("  Validation pass rejected the SQL above, so nothing was executed:")
+        lines.append("  no reconciliation query ran, and no result was recorded for any row.")
+        lines.append("-" * RULE_WIDTH)
     lines.append(
         f"  {report.passed} passed, {report.failed} failed, {report.profiled} profiled, "
         f"{report.blocked_error} blocked/error, {report.not_executed} not executed, "
         f"{report.disabled} disabled"
     )
+    if report.syntax_errors:
+        lines.append(
+            f"  {report.syntax_errors} of those is SYNTAX ERROR: SQL the database refused "
+            f"to compile."
+            if report.syntax_errors == 1
+            else f"  {report.syntax_errors} of those are SYNTAX ERROR: SQL the database "
+            f"refused to compile."
+        )
     lines.append(f"  Overall: {report.overall_status} ({report.enabled_tests} enabled test(s))")
     if report.output_path is not None:
         lines.append(f"  Results written to: {report.output_path}")

@@ -5,9 +5,10 @@ protocol against answers written in the test, so the whole engine — scope
 handling, normalization, comparison, status, observation, output — is exercised
 with no database, no driver and no credential.
 
-Every call is recorded, which is what lets a test assert the property that
-matters most here: that a side a test does not use is never queried, and a
-section no enabled test needs is never even opened.
+Every call is recorded, which is what lets a test assert the properties that
+matter most here: that a side a test does not use is never queried, that a
+section no enabled test needs is never even opened, and that nothing is
+executed until every enabled query has been validated.
 """
 
 from __future__ import annotations
@@ -19,12 +20,21 @@ from typing import Any
 from migration_reconciliation.errors import DatabaseExecutionError
 from migration_reconciliation.models import ConnectionIdentity, DatabaseType
 
-__all__ = ["ScriptedCall", "ScriptedExecutor", "ScriptedExecutors"]
+__all__ = ["ScriptedCall", "ScriptedCheck", "ScriptedExecutor", "ScriptedExecutors"]
 
 
 @dataclass(frozen=True, slots=True)
 class ScriptedCall:
     """One ``execute_scalar`` the engine made."""
+
+    section: str
+    sql: str
+    timeout_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptedCheck:
+    """One ``validate_syntax`` the engine made."""
 
     section: str
     sql: str
@@ -40,13 +50,17 @@ class ScriptedExecutor:
         *,
         default: Any = None,
         by_sql: Mapping[str, Any] | None = None,
+        syntax_by_sql: Mapping[str, Any] | None = None,
         calls: list[ScriptedCall],
+        checks: list[ScriptedCheck],
         opened: list[str],
     ) -> None:
         self.section = section
         self._default = default
         self._by_sql = dict(by_sql or {})
+        self._syntax_by_sql = dict(syntax_by_sql or {})
         self._calls = calls
+        self._checks = checks
         self._opened = opened
         self.closed = False
         self.close_count = 0
@@ -59,6 +73,15 @@ class ScriptedExecutor:
             server_description="scripted",
             database_name=f"{self.section}_db",
         )
+
+    def validate_syntax(self, sql: str, timeout_seconds: int) -> None:
+        """Compile nothing, execute nothing, answer from the script."""
+        if self.closed:
+            raise DatabaseExecutionError(f"Connection '{self.section}' is already closed")
+        self._checks.append(ScriptedCheck(self.section, sql, timeout_seconds))
+        answer = self._syntax_by_sql.get(sql.strip())
+        if isinstance(answer, BaseException):
+            raise answer
 
     def execute_scalar(self, sql: str, timeout_seconds: int) -> Any:
         if self.closed:
@@ -82,12 +105,19 @@ class ScriptedExecutors:
     an exact query. An :class:`Exception` in either position is raised instead
     of returned, which is how timeouts, non-scalar results and driver failures
     are reproduced.
+
+    ``syntax_failures`` does the same for the validation pass: an exception
+    keyed by ``(section, sql)`` is what that query's pre-execution check raises.
+    Queries not named there compile cleanly, so every existing test keeps
+    running exactly as it did.
     """
 
     results: Mapping[str, Any] = field(default_factory=dict)
     by_sql: Mapping[tuple[str, str], Any] = field(default_factory=dict)
+    syntax_failures: Mapping[tuple[str, str], Any] = field(default_factory=dict)
     connect_failures: Mapping[str, str] = field(default_factory=dict)
     calls: list[ScriptedCall] = field(default_factory=list)
+    checks: list[ScriptedCheck] = field(default_factory=list)
     opened: list[str] = field(default_factory=list)
     closed: bool = False
     _executors: dict[str, ScriptedExecutor] = field(default_factory=dict, init=False)
@@ -100,7 +130,13 @@ class ScriptedExecutors:
                 by_sql={
                     sql: answer for (owner, sql), answer in self.by_sql.items() if owner == section
                 },
+                syntax_by_sql={
+                    sql: answer
+                    for (owner, sql), answer in self.syntax_failures.items()
+                    if owner == section
+                },
                 calls=self.calls,
+                checks=self.checks,
                 opened=self.opened,
             )
 
@@ -134,5 +170,11 @@ class ScriptedExecutors:
     def sql_for(self, section: str) -> list[str]:
         return [call.sql for call in self.calls if call.section == section]
 
+    def checked_sql_for(self, section: str) -> list[str]:
+        return [check.sql for check in self.checks if check.section == section]
+
     def queried(self, section: str) -> bool:
         return any(call.section == section for call in self.calls)
+
+    def executed_anything(self) -> bool:
+        return bool(self.calls)

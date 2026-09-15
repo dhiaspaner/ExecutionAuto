@@ -58,10 +58,22 @@ class FakeCursor:
     rows: list[list[Any]]
     column_count: int
     execute_error: Exception | None = None
+    parse_error: Exception | None = None
     no_result_set: bool = False
     timeout: int | None = None
     closed: bool = False
     description: Any = None
+
+    def parse(self, statement: str) -> None:
+        """Oracle's parse-only call: records the SQL and returns no rows."""
+        if self.connection.closed:
+            raise RuntimeError("cursor used after the connection was closed")
+        self.connection.parsed_sql.append(statement)
+        scripted = self.connection.parse_errors_by_sql.get(statement.strip())
+        if isinstance(scripted, Exception):
+            raise scripted
+        if self.parse_error is not None:
+            raise self.parse_error
 
     def execute(self, sql: str) -> None:
         if self.connection.closed:
@@ -99,6 +111,9 @@ class FakeConnection:
     values_by_sql: dict[str, Any] = field(default_factory=dict)
     column_count: int = 1
     execute_error: Exception | None = None
+    #: Per-statement answers for the parse-only call, keyed by exact SQL text.
+    parse_errors_by_sql: dict[str, Any] = field(default_factory=dict)
+    parse_error: Exception | None = None
     no_result_set: bool = False
     close_error: Exception | None = None
     version: str = "19.0.0.0.0"
@@ -106,6 +121,7 @@ class FakeConnection:
     closed: bool = False
     close_count: int = 0
     executed_sql: list[str] = field(default_factory=list)
+    parsed_sql: list[str] = field(default_factory=list)
     fetch_sizes: list[int] = field(default_factory=list)
     cursors: list[FakeCursor] = field(default_factory=list)
     closed_cursors: list[FakeCursor] = field(default_factory=list)
@@ -117,6 +133,7 @@ class FakeConnection:
             rows=list(self.rows),
             column_count=self.column_count,
             execute_error=self.execute_error,
+            parse_error=self.parse_error,
             no_result_set=self.no_result_set,
         )
         self.cursors.append(cursor)

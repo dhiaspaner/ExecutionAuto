@@ -18,7 +18,11 @@ from migration_reconciliation.database.fake import (
     load_fake_results,
     parse_fake_results,
 )
-from migration_reconciliation.errors import DatabaseExecutionError, ReconciliationError
+from migration_reconciliation.errors import (
+    DatabaseExecutionError,
+    ReconciliationError,
+    SqlSyntaxError,
+)
 from migration_reconciliation.models import DatabaseType
 from tests.conftest import EXAMPLE_FIXTURE_PATH
 
@@ -234,3 +238,57 @@ def test_runner_module_imports_no_database_driver() -> None:
 
     assert "pyodbc" not in sys.modules
     assert "oracledb" not in sys.modules
+
+
+# -- the scripted validation pass ---------------------------------------------
+
+
+def test_validation_passes_by_default_and_executes_nothing() -> None:
+    executor = _executor(FakeResponse(value=1500))
+
+    executor.validate_syntax("SELECT COUNT(*) FROM PAYMENTS", 30)
+
+    assert executor.validated_sql == ["SELECT COUNT(*) FROM PAYMENTS"]
+    assert executor.executed_sql == []
+
+
+def test_a_scripted_syntax_error_is_raised_before_execution() -> None:
+    executor = _executor(FakeResponse(value=1, syntax_error="ORA-00904: invalid identifier"))
+
+    with pytest.raises(SqlSyntaxError, match="ORA-00904"):
+        executor.validate_syntax("SELECT NO_SUCH_COLUMN FROM PAYMENTS", 30)
+
+    assert executor.executed_sql == []
+
+
+def test_validation_rejects_a_non_positive_timeout() -> None:
+    with pytest.raises(DatabaseExecutionError, match="greater than 0"):
+        _executor(FakeResponse(value=1)).validate_syntax("SELECT 1", 0)
+
+
+def test_a_fixture_can_script_a_syntax_error_per_side() -> None:
+    book = parse_fake_results(
+        {
+            "version": "1.0",
+            "case": [
+                {
+                    "test_case_id": "TC-001",
+                    "source_syntax_error": "ORA-00942",
+                    "target_result": 5,
+                }
+            ],
+        }
+    )
+
+    assert book.response_for("TC-001", QuerySide.SOURCE).syntax_error == "ORA-00942"
+    assert book.response_for("TC-001", QuerySide.TARGET).syntax_error is None
+
+
+def test_a_syntax_error_that_is_not_text_is_rejected() -> None:
+    with pytest.raises(ReconciliationError, match="source_syntax_error must be a string"):
+        parse_fake_results(
+            {
+                "version": "1.0",
+                "case": [{"test_case_id": "TC-001", "source_syntax_error": 42}],
+            }
+        )

@@ -163,6 +163,25 @@ they reach a driver.
 It is not a substitute for read-only accounts, and must never be presented as
 one.
 
+### What the framework itself sends
+
+Beyond the workbook's own queries, a run sends exactly three statements of its
+own, all of them part of the pre-execution validation pass:
+
+| Engine | Statement | Why it is safe on a read-only account |
+| --- | --- | --- |
+| SQL Server | `SET NOEXEC ON` / `SET NOEXEC OFF` | Session options. They need no permission, read nothing and write nothing. |
+| Oracle | the driver's parse-only call | Parses the statement the server would have parsed anyway before executing it. |
+
+`SET NOEXEC ON` is switched off again in a `finally`, and a session that does
+not confirm the switch-off is closed rather than reused — a connection left in
+`NOEXEC` would silently execute nothing for the rest of the run.
+
+Oracle's `EXPLAIN PLAN FOR` is deliberately **not** used for this. It answers the
+same question, but it inserts rows into `PLAN_TABLE`, which a `SELECT`-only
+account cannot do: the check would fail on exactly the accounts this document
+requires.
+
 ## 10. Result workbooks still deserve care
 
 A result workbook contains counts and totals for real client data, and it

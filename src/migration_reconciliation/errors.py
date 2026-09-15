@@ -15,7 +15,9 @@ __all__ = [
     "QueryTimeoutError",
     "ReconciliationError",
     "SchemaError",
+    "SqlSyntaxError",
     "SqlValidationError",
+    "SyntaxCheckUnavailableError",
     "TypeConversionError",
     "WorkbookError",
 ]
@@ -51,6 +53,24 @@ class ConnectionFailedError(DatabaseExecutionError):
 
 class QueryTimeoutError(DatabaseExecutionError):
     """A query exceeded the timeout configured for it."""
+
+
+class SqlSyntaxError(DatabaseExecutionError):
+    """The database refused to compile a query during the pre-execution check.
+
+    Raised only by :meth:`~.database.base.QueryExecutor.validate_syntax`, where
+    nothing has been executed and nothing can have been: the statement never
+    got past compilation. The message is the driver's own, sanitized.
+    """
+
+
+class SyntaxCheckUnavailableError(DatabaseExecutionError):
+    """The database could not be *asked* whether a query compiles.
+
+    Deliberately not a syntax failure. Nothing has been proven about the SQL
+    either way, so a run warns and carries on rather than condemning a query
+    the server never looked at.
+    """
 
 
 class NonScalarResultError(DatabaseExecutionError):

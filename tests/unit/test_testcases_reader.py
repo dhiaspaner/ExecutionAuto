@@ -432,6 +432,7 @@ def test_the_status_vocabulary_is_the_documented_one() -> None:
         "FAIL",
         "PROFILED",
         "ERROR",
+        "SYNTAX ERROR",
         "BLOCKED",
         "CONFIG ERROR",
         "NOT EXECUTED",

@@ -10,7 +10,11 @@ import pytest
 from migration_reconciliation.database.base import QuerySide
 from migration_reconciliation.database.oracle import OracleExecutor
 from migration_reconciliation.database.settings import ConnectionSettings
-from migration_reconciliation.errors import DatabaseExecutionError
+from migration_reconciliation.errors import (
+    DatabaseExecutionError,
+    SqlSyntaxError,
+    SyntaxCheckUnavailableError,
+)
 from migration_reconciliation.models import DatabaseType
 from tests.drivers import FakeConnection, FakeOracleDb, oracle_error
 
@@ -331,3 +335,129 @@ def test_thick_mode_is_rejected_for_sql_server() -> None:
 
     with pytest.raises(ReconciliationError, match="Oracle connections only"):
         settings(database_type=DatabaseType.SQLSERVER, use_thick_client=True)
+
+
+# -- validating SQL without executing it --------------------------------------
+
+
+def test_validation_parses_the_statement_and_executes_nothing() -> None:
+    connection = FakeConnection()
+    executor = OracleExecutor(settings(), driver=FakeOracleDb(connection=connection))
+
+    executor.validate_syntax("SELECT COUNT(*) FROM PAYMENTS", 30)
+
+    assert connection.parsed_sql == ["SELECT COUNT(*) FROM PAYMENTS"]
+    assert connection.executed_sql == []
+    assert connection.fetch_sizes == []
+
+
+def test_validation_never_writes_a_plan_table() -> None:
+    """EXPLAIN PLAN inserts rows; the read-only account this framework needs cannot."""
+    connection = FakeConnection()
+    executor = OracleExecutor(settings(), driver=FakeOracleDb(connection=connection))
+
+    executor.validate_syntax("SELECT COUNT(*) FROM PAYMENTS", 30)
+
+    statements = " ".join(connection.parsed_sql + connection.executed_sql).upper()
+    assert "EXPLAIN PLAN" not in statements
+    assert "PLAN_TABLE" not in statements
+
+
+def test_oracle_sql_is_not_translated_before_it_is_parsed() -> None:
+    connection = FakeConnection()
+    sql = "SELECT COUNT(*) FROM legacy.payments WHERE ROWNUM <= 1"
+
+    OracleExecutor(settings(), driver=FakeOracleDb(connection=connection)).validate_syntax(sql, 30)
+
+    assert connection.parsed_sql == [sql]
+
+
+def test_a_statement_oracle_rejects_is_a_syntax_error() -> None:
+    connection = FakeConnection(
+        parse_errors_by_sql={
+            "SELECT COUNT(*) FROM PAYMNETS": oracle_error(942, "table or view does not exist")
+        }
+    )
+    executor = OracleExecutor(settings(), driver=FakeOracleDb(connection=connection))
+
+    with pytest.raises(SqlSyntaxError, match="does not exist"):
+        executor.validate_syntax("SELECT COUNT(*) FROM PAYMNETS", 30)
+
+
+def test_a_lost_connection_during_a_parse_is_not_reported_as_bad_sql() -> None:
+    connection = FakeConnection(
+        parse_errors_by_sql={
+            "SELECT 1 FROM DUAL": oracle_error(6005, "cannot connect to database", prefix="DPY")
+        }
+    )
+    executor = OracleExecutor(settings(), driver=FakeOracleDb(connection=connection))
+
+    with pytest.raises(SyntaxCheckUnavailableError):
+        executor.validate_syntax("SELECT 1 FROM DUAL", 30)
+
+
+def test_validation_applies_the_call_timeout_and_restores_it() -> None:
+    connection = FakeConnection(call_timeout=0)
+    executor = OracleExecutor(settings(), driver=FakeOracleDb(connection=connection))
+
+    executor.validate_syntax("SELECT 1 FROM DUAL", 20)
+
+    assert 20_000 in connection.call_timeouts_seen
+    assert connection.call_timeout == 0
+
+
+def test_validation_closes_its_cursor() -> None:
+    connection = FakeConnection()
+    executor = OracleExecutor(settings(), driver=FakeOracleDb(connection=connection))
+
+    executor.validate_syntax("SELECT 1 FROM DUAL", 30)
+
+    assert all(cursor.closed for cursor in connection.cursors)
+
+
+def test_validation_refuses_a_timeout_of_zero() -> None:
+    executor = OracleExecutor(settings(), driver=FakeOracleDb())
+
+    with pytest.raises(DatabaseExecutionError, match="greater than 0"):
+        executor.validate_syntax("SELECT 1 FROM DUAL", 0)
+
+
+def test_a_driver_without_a_parse_call_reports_an_unavailable_check() -> None:
+    class CursorWithoutParse:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class ConnectionWithoutParse:
+        call_timeout = 0
+
+        def cursor(self) -> CursorWithoutParse:
+            return CursorWithoutParse()
+
+    class DriverWithoutParse:
+        def init_oracle_client(self, **kwargs: Any) -> None:
+            return None
+
+        def connect(self, **kwargs: Any) -> ConnectionWithoutParse:
+            return ConnectionWithoutParse()
+
+    executor = OracleExecutor(settings(), driver=DriverWithoutParse())
+
+    with pytest.raises(SyntaxCheckUnavailableError, match="parse-only"):
+        executor.validate_syntax("SELECT 1 FROM DUAL", 30)
+
+
+def test_the_password_never_reaches_a_validation_failure() -> None:
+    connection = FakeConnection(
+        parse_errors_by_sql={
+            "SELECT 1 FROM DUAL": oracle_error(904, f"invalid identifier password={SECRET}")
+        }
+    )
+    executor = OracleExecutor(settings(), driver=FakeOracleDb(connection=connection))
+
+    with pytest.raises(SqlSyntaxError) as raised:
+        executor.validate_syntax("SELECT 1 FROM DUAL", 30)
+
+    assert SECRET not in str(raised.value)

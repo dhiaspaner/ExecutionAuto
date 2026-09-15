@@ -35,11 +35,18 @@ from ..errors import (
     DatabaseExecutionError,
     NonScalarResultError,
     QueryTimeoutError,
+    SqlSyntaxError,
+    SyntaxCheckUnavailableError,
 )
 from ..models import ConnectionIdentity, ScalarValue
 from ..security.redaction import sanitize_error
 from .base import single_scalar
-from .failures import connection_failure_message, is_timeout_failure
+from .failures import (
+    FailureCause,
+    classify_failure,
+    connection_failure_message,
+    is_timeout_failure,
+)
 from .settings import ConnectionSettings
 
 __all__ = ["OracleExecutor"]
@@ -92,6 +99,49 @@ class OracleExecutor:
             account_name=self._settings.username,
             product_version=self._product_version(),
         )
+
+    # -- validation ------------------------------------------------------
+
+    def validate_syntax(self, sql: str, timeout_seconds: int) -> None:
+        """Parse ``sql`` on the server without executing it.
+
+        ``Cursor.parse()`` asks Oracle to do only the parse step it would do
+        anyway before executing: the statement is checked for syntax and for
+        the objects and columns it names, no row is read, and no cursor is
+        left open.
+
+        ``EXPLAIN PLAN FOR`` would answer the same question, but it *inserts*
+        into ``PLAN_TABLE``, which the read-only account this framework
+        requires cannot do — the check would fail on exactly the accounts
+        production uses. Parsing needs no privilege beyond the one the query
+        itself needs.
+        """
+        if timeout_seconds <= 0:
+            raise DatabaseExecutionError(
+                f"Timeout must be greater than 0 seconds (got {timeout_seconds})"
+            )
+        self.connect()
+        connection = self._connection
+        assert connection is not None  # connect() raises otherwise
+        label = f"{self._settings.side.value.capitalize()} query"
+
+        previous_timeout = getattr(connection, "call_timeout", 0)
+        cursor = connection.cursor()
+        try:
+            connection.call_timeout = timeout_seconds * 1000
+            parse = getattr(cursor, "parse", None)
+            if not callable(parse):
+                raise SyntaxCheckUnavailableError(
+                    f"{label} could not be checked: this oracledb build offers no parse-only "
+                    f"call, so nothing is known about the SQL either way."
+                )
+            try:
+                parse(sql)
+            except Exception as exc:
+                raise _syntax_failure(exc, label, timeout_seconds) from None
+        finally:
+            _quietly(cursor.close)
+            _restore_call_timeout(connection, previous_timeout)
 
     # -- execution -------------------------------------------------------
 
@@ -230,3 +280,23 @@ def _execution_failure(
     if is_timeout_failure(exc):
         return QueryTimeoutError(f"{label} exceeded the {timeout_seconds}s timeout. {message}")
     return DatabaseExecutionError(message)
+
+
+def _syntax_failure(exc: BaseException, label: str, timeout_seconds: int) -> DatabaseExecutionError:
+    """Separate "the SQL is wrong" from "the check could not be made".
+
+    ORA-00904 and ORA-00942 are answers: the query does not compile. A lost
+    connection or an expired timeout is not an answer at all, and reporting one
+    as a syntax error would condemn a query the server never finished reading.
+    """
+    detail = sanitize_error(exc, max_length=200)
+    if is_timeout_failure(exc):
+        return QueryTimeoutError(
+            f"{label} did not parse within the {timeout_seconds}s timeout, so nothing is "
+            f"known about its syntax. {detail}"
+        )
+    if classify_failure(exc) is FailureCause.NETWORK:
+        return SyntaxCheckUnavailableError(
+            f"{label} could not be checked: the connection failed during the check. {detail}"
+        )
+    return SqlSyntaxError(f"{label} was rejected by the database before execution: {detail}")

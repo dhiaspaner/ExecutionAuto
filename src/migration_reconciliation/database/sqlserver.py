@@ -23,11 +23,18 @@ from ..errors import (
     DatabaseExecutionError,
     NonScalarResultError,
     QueryTimeoutError,
+    SqlSyntaxError,
+    SyntaxCheckUnavailableError,
 )
 from ..models import ConnectionIdentity, ScalarValue
 from ..security.redaction import sanitize_error
 from .base import single_scalar
-from .failures import connection_failure_message, is_timeout_failure
+from .failures import (
+    FailureCause,
+    classify_failure,
+    connection_failure_message,
+    is_timeout_failure,
+)
 from .settings import ConnectionSettings
 
 __all__ = ["PREFERRED_DRIVERS", "SqlServerExecutor"]
@@ -86,6 +93,64 @@ class SqlServerExecutor:
             account_name=self._account_name(),
             product_version=self._product_version(),
         )
+
+    # -- validation ------------------------------------------------------
+
+    def validate_syntax(self, sql: str, timeout_seconds: int) -> None:
+        """Compile ``sql`` on the server without executing it.
+
+        ``SET NOEXEC ON`` makes SQL Server parse and compile every following
+        statement and execute none of them, so a syntax error, an unknown table
+        and a misspelled column are all reported while no row is ever read.
+
+        The option belongs to the *session*, and this session goes on to run
+        the real queries, so turning it off again is not tidiness — a session
+        left with ``NOEXEC ON`` would silently execute nothing for the rest of
+        the run. It is switched off in a ``finally``, and a session whose
+        switch-off did not confirm is dropped rather than reused.
+        """
+        if timeout_seconds <= 0:
+            raise DatabaseExecutionError(
+                f"Timeout must be greater than 0 seconds (got {timeout_seconds})"
+            )
+        self.connect()
+        assert self._connection is not None  # connect() raises otherwise
+        label = f"{self._settings.side.value.capitalize()} query"
+
+        cursor = self._connection.cursor()
+        try:
+            cursor.timeout = timeout_seconds
+            try:
+                cursor.execute("SET NOEXEC ON")
+            except Exception as exc:
+                raise SyntaxCheckUnavailableError(
+                    f"{label} could not be checked: the server refused SET NOEXEC ON. "
+                    f"{sanitize_error(exc, max_length=200)}"
+                ) from None
+            try:
+                cursor.execute(sql)
+            except Exception as exc:
+                raise _syntax_failure(exc, label, timeout_seconds) from None
+            finally:
+                self._resume_execution(cursor, label)
+        finally:
+            _quietly(cursor.close)
+
+    def _resume_execution(self, cursor: Any, label: str) -> None:
+        """Undo ``SET NOEXEC ON``, or throw the session away.
+
+        A connection that might still be in NOEXEC is worse than no connection:
+        every later query would succeed and return nothing. Closing it means
+        the next query opens a fresh session instead.
+        """
+        try:
+            cursor.execute("SET NOEXEC OFF")
+        except Exception as exc:
+            self.close()
+            raise SyntaxCheckUnavailableError(
+                f"{label} was checked but SET NOEXEC OFF did not confirm, so the session "
+                f"was closed rather than reused. {sanitize_error(exc, max_length=200)}"
+            ) from None
 
     # -- execution -------------------------------------------------------
 
@@ -228,3 +293,24 @@ def _execution_failure(
     if is_timeout_failure(exc):
         return QueryTimeoutError(f"{label} exceeded the {timeout_seconds}s timeout. {message}")
     return DatabaseExecutionError(message)
+
+
+def _syntax_failure(exc: BaseException, label: str, timeout_seconds: int) -> DatabaseExecutionError:
+    """Separate "the SQL is wrong" from "the check could not be made".
+
+    A compile error is the answer the check exists to get. A dropped
+    connection or an expired timeout is not an answer at all, and reporting
+    one as a syntax error would condemn a query the server never finished
+    looking at.
+    """
+    detail = sanitize_error(exc, max_length=200)
+    if is_timeout_failure(exc):
+        return QueryTimeoutError(
+            f"{label} did not compile within the {timeout_seconds}s timeout, so nothing "
+            f"is known about its syntax. {detail}"
+        )
+    if classify_failure(exc) is FailureCause.NETWORK:
+        return SyntaxCheckUnavailableError(
+            f"{label} could not be checked: the connection failed during the check. {detail}"
+        )
+    return SqlSyntaxError(f"{label} was rejected by the database before execution: {detail}")

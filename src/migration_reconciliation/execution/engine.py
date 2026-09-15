@@ -1,6 +1,20 @@
-"""Executing a plan: query, normalize, compare, decide, describe.
+"""Executing a plan: validate everything, then query, normalize, compare, decide.
 
-The order is fixed and the boundaries are deliberate. Queries produce raw
+A run makes two passes over the enabled tests, and the first one executes
+nothing at all. Pass 1 asks each database to *compile* every query it is about
+to be given — ``SET NOEXEC ON`` on SQL Server, a parse-only call on Oracle — and
+writes the workbook with what it found. If anything failed to compile the run
+stops there: no reconciliation SQL is executed, and no result column is filled
+in for any row. Only a completely clean validation pass reaches pass 2, which is
+the execute-compare-decide pipeline described below.
+
+The gate exists because a half-executed reconciliation is the expensive kind of
+wrong. Finding a typo in the last of two hundred rows after the first hundred
+and ninety-nine have already run against production leaves a workbook that is
+part results, part damage report, and no way to tell at a glance which half is
+which.
+
+Within pass 2 the order is fixed and the boundaries are deliberate. Queries produce raw
 scalars; normalization turns them into the declared type; a registered Python
 function compares them; the status and error code come out of that comparison;
 and only then is an observation worded. Nothing later in that chain can change
@@ -17,7 +31,7 @@ quietly omitted, because a run with unexecuted tests is never a pass.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -33,6 +47,8 @@ from ..errors import (
     NonScalarResultError,
     QueryTimeoutError,
     ReconciliationError,
+    SqlSyntaxError,
+    SyntaxCheckUnavailableError,
     TypeConversionError,
     WorkbookError,
 )
@@ -62,7 +78,10 @@ __all__ = [
 ]
 
 #: Recorded in ``Run History`` so a result can be traced to the code that made it.
-EXECUTOR_VERSION = "2.0"
+EXECUTOR_VERSION = "2.1"
+
+#: How many failing test ids a gate message names before it stops listing them.
+_NAMED_IN_GATE_MESSAGE = 5
 
 _PLATFORM_OF_SIDE: Mapping[str, Platform] = {
     "source": Platform.SOURCE,
@@ -145,6 +164,9 @@ class RunReport:
     executor_version: str = EXECUTOR_VERSION
     output_path: Path | None = None
     dry_run: bool = False
+    #: True when pass 1 found SQL that would not compile, so pass 2 never ran
+    #: and no reconciliation query was executed.
+    stopped_by_validation: bool = False
     warnings: tuple[str, ...] = ()
     connections: tuple[str, ...] = ()
 
@@ -169,8 +191,18 @@ class RunReport:
         return self._count(TestStatus.PROFILED)
 
     @property
+    def syntax_errors(self) -> int:
+        """Tests whose SQL the database refused to compile, before any ran."""
+        return self._count(TestStatus.SYNTAX_ERROR)
+
+    @property
     def blocked_error(self) -> int:
-        return self._count(TestStatus.ERROR, TestStatus.BLOCKED, TestStatus.CONFIG_ERROR)
+        return self._count(
+            TestStatus.ERROR,
+            TestStatus.SYNTAX_ERROR,
+            TestStatus.BLOCKED,
+            TestStatus.CONFIG_ERROR,
+        )
 
     @property
     def not_executed(self) -> int:
@@ -258,6 +290,7 @@ def execute_plan(
         )
 
     connections: tuple[str, ...] = ()
+    gate_closed = False
     try:
         if control.dry_run:
             reason = "Dry run: the test was validated but no SQL was executed."
@@ -277,7 +310,9 @@ def execute_plan(
             )
         else:
             connections = executors.sections
-            _execute_tests(plan, executors, outcomes, control, identifier, started)
+            passes = _execute_tests(plan, executors, outcomes, control, identifier)
+            warnings.extend(passes.warnings)
+            gate_closed = passes.gate_closed
     finally:
         if executors is not None:
             executors.close_all()
@@ -290,6 +325,7 @@ def execute_plan(
         outcomes=outcomes.sorted(),
         template_version=control.template_version,
         dry_run=control.dry_run,
+        stopped_by_validation=gate_closed,
         warnings=tuple(warnings),
         connections=connections,
     )
@@ -304,36 +340,211 @@ def execute_plan(
 # -- execution ---------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _Passes:
+    """What the two passes had to say to the run as a whole."""
+
+    warnings: tuple[str, ...] = ()
+    gate_closed: bool = False
+
+
 def _execute_tests(
     plan: ExecutionPlan,
     executors: Executors,
     outcomes: _Outcomes,
     control: RunControl,
     run_id: str,
-    started: datetime,
-) -> None:
+) -> _Passes:
+    """Validate every enabled test, then execute them only if all of them passed."""
     _identities, failures = executors.open_all()
-    stopped_reason = ""
 
+    runnable: list[TestDefinition] = []
     for definition in plan.executable:
-        if stopped_reason:
-            outcomes.add(_not_executed(definition, stopped_reason, plan.rules, control, run_id))
-            continue
-
         blocked_section = next(
             (section for section in definition.sections() if section in failures), None
         )
-        if blocked_section is not None:
-            outcomes.add(
-                _blocked(
-                    definition,
-                    blocked_section,
-                    failures[blocked_section],
-                    plan.rules,
-                    control,
-                    run_id,
-                )
+        if blocked_section is None:
+            runnable.append(definition)
+            continue
+        # A connection that never opened is not evidence about anyone's SQL, so
+        # these rows are set aside rather than counted against the gate: a dead
+        # source must not stop the target-only tests from running.
+        outcomes.add(
+            _blocked(
+                definition,
+                blocked_section,
+                failures[blocked_section],
+                plan.rules,
+                control,
+                run_id,
             )
+        )
+
+    validation = _validate_tests(runnable, executors, plan.rules, control, run_id)
+    for outcome in validation.failures:
+        outcomes.add(outcome)
+
+    if validation.failures:
+        reason = _gate_reason(validation.failures)
+        for definition in validation.passed:
+            outcomes.add(_not_executed(definition, reason, plan.rules, control, run_id))
+        return _Passes(warnings=(*validation.warnings, reason), gate_closed=True)
+
+    _run_tests(validation.passed, executors, outcomes, plan, control, run_id)
+    return _Passes(warnings=validation.warnings)
+
+
+# -- pass 1: validation ------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Validation:
+    """The result of pass 1: who may run, who may not, and what to warn about."""
+
+    passed: tuple[TestDefinition, ...] = ()
+    failures: tuple[TestOutcome, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+def _validate_tests(
+    definitions: Sequence[TestDefinition],
+    executors: Executors,
+    rules: ObservationRules,
+    control: RunControl,
+    run_id: str,
+) -> _Validation:
+    """Ask the databases to compile every query, and execute none of them.
+
+    Every test is checked even once one has failed. The point of this pass is a
+    workbook that names *all* the broken rows at once, so they can be fixed in
+    one sitting rather than one run each.
+    """
+    checked_at = datetime.now(UTC).replace(microsecond=0)
+    passed: list[TestDefinition] = []
+    failures: list[TestOutcome] = []
+    warnings: list[str] = []
+    unavailable: set[str] = set()
+
+    for definition in definitions:
+        failure = _validate_one(
+            definition, executors, rules, control, run_id, checked_at, unavailable, warnings
+        )
+        if failure is None:
+            passed.append(definition)
+        else:
+            failures.append(failure)
+
+    return _Validation(tuple(passed), tuple(failures), tuple(warnings))
+
+
+def _validate_one(
+    definition: TestDefinition,
+    executors: Executors,
+    rules: ObservationRules,
+    control: RunControl,
+    run_id: str,
+    checked_at: datetime,
+    unavailable: set[str],
+    warnings: list[str],
+) -> TestOutcome | None:
+    """Check one test's queries. ``None`` means every side compiled.
+
+    The first side that fails decides the row: one row carries one status, and
+    a test with a broken source query is broken whatever its target query says.
+    """
+    for side in _sides_of(definition.scope):
+        section = definition.source_section if side == "source" else definition.target_section
+        sql = definition.source_sql if side == "source" else definition.target_sql
+        try:
+            executors.executor_for(section).validate_syntax(sql, control.query_timeout_seconds)
+        except SyntaxCheckUnavailableError as exc:
+            # Nothing was proven about this SQL either way, so it is not a
+            # failure — but the run says out loud that it is going in unchecked.
+            if section not in unavailable:
+                unavailable.add(section)
+                warnings.append(
+                    f"[{section}] could not be asked to check SQL before running it, so its "
+                    f"queries were not validated: "
+                    f"{sanitize_error(exc, max_length=control.error_detail_max_length)}"
+                )
+            continue
+        except Exception as exc:
+            return _validation_failure(
+                definition, side, exc, rules, control, run_id, checked_at, executors
+            )
+    return None
+
+
+def _validation_failure(
+    definition: TestDefinition,
+    side: str,
+    exc: BaseException,
+    rules: ObservationRules,
+    control: RunControl,
+    run_id: str,
+    checked_at: datetime,
+    executors: Executors,
+) -> TestOutcome:
+    """Turn a failed check into a row, without ever claiming a result."""
+    if isinstance(exc, SqlSyntaxError):
+        status, code = TestStatus.SYNTAX_ERROR, ErrorCode.SYNTAX_ERROR
+    elif isinstance(exc, QueryTimeoutError):
+        status, code = TestStatus.ERROR, ErrorCode.QUERY_TIMEOUT
+    elif isinstance(exc, ConnectionFailedError):
+        status, code = TestStatus.BLOCKED, ErrorCode.CONNECTION_FAILED
+    else:
+        status, code = TestStatus.ERROR, ErrorCode.SYNTAX_CHECK_FAILED
+
+    detail = sanitize_error(exc, max_length=control.error_detail_max_length)
+    advice = describe_object_access_failure(detail)
+    if advice:
+        detail = f"{detail} {advice}"
+
+    section = definition.source_section if side == "source" else definition.target_section
+    return _outcome(
+        definition,
+        status,
+        _PLATFORM_OF_SIDE[side],
+        code,
+        detail,
+        rules,
+        control,
+        run_id,
+        executed_at=checked_at,
+        databases={side: executors.database_name(section)},
+    )
+
+
+def _gate_reason(failures: Sequence[TestOutcome]) -> str:
+    """Why nothing ran, naming the rows that have to be fixed first."""
+    named = ", ".join(
+        outcome.test_id or f"row {outcome.row_number}"
+        for outcome in failures[:_NAMED_IN_GATE_MESSAGE]
+    )
+    remainder = len(failures) - _NAMED_IN_GATE_MESSAGE
+    more = f" and {remainder} more" if remainder > 0 else ""
+    return (
+        f"Nothing was executed: {len(failures)} test(s) failed the pre-execution SQL check "
+        f"({named}{more}). Fix that SQL and run again."
+    )
+
+
+# -- pass 2: execution -------------------------------------------------------
+
+
+def _run_tests(
+    definitions: Sequence[TestDefinition],
+    executors: Executors,
+    outcomes: _Outcomes,
+    plan: ExecutionPlan,
+    control: RunControl,
+    run_id: str,
+) -> None:
+    """Execute the tests pass 1 cleared, in row order."""
+    stopped_reason = ""
+    for definition in definitions:
+        if stopped_reason:
+            outcomes.add(_not_executed(definition, stopped_reason, plan.rules, control, run_id))
             continue
 
         outcome = _execute_one(definition, executors, plan.rules, control, run_id)
@@ -710,6 +921,7 @@ def _write_results(plan: ExecutionPlan, report: RunReport, *, output_dir: Path |
             template_version=report.template_version,
             output_path=destination,
             dry_run=report.dry_run,
+            stopped_by_validation=report.stopped_by_validation,
             warnings=report.warnings,
             connections=report.connections,
         )

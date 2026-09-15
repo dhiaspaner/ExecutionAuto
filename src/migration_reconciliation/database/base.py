@@ -33,6 +33,26 @@ class QueryExecutor(Protocol):
         """Confirm the connection works and describe it without secrets."""
         ...
 
+    def validate_syntax(self, sql: str, timeout_seconds: int) -> None:
+        """Ask the database whether ``sql`` compiles, without executing it.
+
+        This is the first of the two passes a run makes: every enabled query is
+        compiled by the server before any of them is executed, so a typo in the
+        last row cannot be discovered halfway through a reconciliation.
+
+        Implementations must use a mechanism that reads nothing and writes
+        nothing — SQL Server's ``SET NOEXEC ON``, Oracle's parse-only call —
+        and must leave the session exactly as they found it, because the very
+        same connection goes on to run the real queries.
+
+        Returns ``None`` when the query compiles. Raises
+        :class:`~..errors.SqlSyntaxError` when the database rejects it, and
+        :class:`~..errors.SyntaxCheckUnavailableError` when the check itself
+        could not be performed — which proves nothing about the SQL and must
+        never be reported as if it did.
+        """
+        ...
+
     def execute_scalar(self, sql: str, timeout_seconds: int) -> ScalarValue:
         """Run ``sql`` and return its single scalar value.
 

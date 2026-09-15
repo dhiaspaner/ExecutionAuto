@@ -135,9 +135,18 @@ The runner depends on two protocols and never on a driver:
 ```python
 class QueryExecutor(Protocol):
     def test_connection(self) -> ConnectionIdentity: ...
+    def validate_syntax(self, sql: str, timeout_seconds: int) -> None: ...
     def execute_scalar(self, sql: str, timeout_seconds: int) -> ScalarValue: ...
     def close(self) -> None: ...
 ```
+
+`validate_syntax` asks the database to compile a query without executing it, and
+each engine answers in its own way: SQL Server under `SET NOEXEC ON`, Oracle
+through the driver's parse-only call. Both read nothing, write nothing and leave
+the session exactly as they found it — the same session goes on to run the real
+queries. It raises `SqlSyntaxError` when the database rejects the SQL and
+`SyntaxCheckUnavailableError` when the check could not be made at all, and the
+two are never conflated: the second proves nothing about the SQL.
 
 `ExecutorFactory` supplies executors by logical connection name and owns their
 lifetime. Every request passes `test_case_id` and `side` (source or target):
@@ -299,11 +308,20 @@ reconcile run
  |     '-- SectionExecutors            one session per section, shared by all tests
  |
  |-- execution.engine.execute_plan
- |     |-- execute_scalar per required side, each with its own timeout
- |     |-- evaluation.normalization  raw scalar -> declared Result_Type
- |     |-- evaluation.comparisons    a registered Python function decides
- |     |-- status + error code       from the comparison, never from the workbook
- |     '-- workbook.observations     wording for a decision already made
+ |     |
+ |     |-- PASS 1  validate_syntax per required side. Compiles, executes nothing.
+ |     |     |-- rejected  -> Status = SYNTAX ERROR, results left empty
+ |     |     '-- unavailable -> run warning; the SQL is not condemned unchecked
+ |     |
+ |     |-- GATE    any pass-1 failure stops the run here. Everything that did
+ |     |           validate is written NOT EXECUTED; no query is ever executed.
+ |     |
+ |     '-- PASS 2  reached only after a clean pass 1
+ |           |-- execute_scalar per required side, each with its own timeout
+ |           |-- evaluation.normalization  raw scalar -> declared Result_Type
+ |           |-- evaluation.comparisons    a registered Python function decides
+ |           |-- status + error code       from the comparison, never the workbook
+ |           '-- workbook.observations     wording for a decision already made
  |
  '-- workbook.output.ResultWriter    Opens a WRITABLE copy
        |-- clear stale outputs, write output columns only
@@ -311,7 +329,8 @@ reconcile run
        '-- save to a temp file, then os.replace into position
 ```
 
-Two passes over the workbook is deliberate. The read pass uses
+Two passes over the *file* are deliberate too, and are a different thing from
+the two passes over the tests above. The read pass uses
 `data_only=True`, which resolves cached formula values but would discard the
 formulas on save; the write pass keeps formulas, formatting and validation
 intact. The file being validated is therefore never the file being modified.
@@ -322,6 +341,9 @@ intact. The file being validated is therefore never the file being modified.
   expression or action from a sheet is evaluated anywhere.
 * `Execution_Scope` decides which sections are opened, and nothing outside that
   set is connected to.
+* No reconciliation query is executed until every enabled query has been
+  compiled by its own database. A run is either fully executed or not executed
+  at all — never half of each.
 * Observation rules describe a status Python has already decided.
 * Only execution-output columns and `Run History` are ever written.
 * No password reaches TOML, Excel, a log or an exception message.

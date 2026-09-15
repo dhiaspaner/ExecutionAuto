@@ -301,14 +301,20 @@ class TestStatus(StrEnum):
     """The small, stable status set written to ``Status``.
 
     Specific reasons live in ``Error_Code`` and the platform, never in extra
-    statuses: a report that filters on eight values stays readable, and a new
+    statuses: a report that filters on nine values stays readable, and a new
     failure mode never needs a new status.
+
+    ``SYNTAX ERROR`` is the one status that is not decided by executing
+    anything. It means the pre-execution validation pass asked the database to
+    compile that query and the database refused it, so the run stopped before
+    any reconciliation SQL was executed at all.
     """
 
     PASS = "PASS"
     FAIL = "FAIL"
     PROFILED = "PROFILED"
     ERROR = "ERROR"
+    SYNTAX_ERROR = "SYNTAX ERROR"
     BLOCKED = "BLOCKED"
     CONFIG_ERROR = "CONFIG ERROR"
     NOT_EXECUTED = "NOT EXECUTED"
@@ -355,6 +361,10 @@ class ErrorCode(StrEnum):
     UNEXPECTED_TARGET_SQL = "UNEXPECTED_TARGET_SQL"
     MISSING_EXPECTED_VALUE = "MISSING_EXPECTED_VALUE"
     UNSAFE_SQL = "UNSAFE_SQL"
+
+    # Pre-execution validation
+    SYNTAX_ERROR = "SYNTAX_ERROR"
+    SYNTAX_CHECK_FAILED = "SYNTAX_CHECK_FAILED"
 
     # Execution
     CONNECTION_FAILED = "CONNECTION_FAILED"

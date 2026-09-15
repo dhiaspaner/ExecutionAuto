@@ -82,6 +82,9 @@ BUILT_IN_OBSERVATIONS: Mapping[TestStatus, str] = {
     TestStatus.FAIL: "{test_id} failed ({error_code}). {error_detail}",
     TestStatus.PROFILED: "{test_id} profiled: actual {actual_value}. {error_detail}",
     TestStatus.ERROR: "{test_id} errored on {platform} ({error_code}). {error_detail}",
+    TestStatus.SYNTAX_ERROR: (
+        "{test_id} was not executed: {platform} refused to compile its SQL. {error_detail}"
+    ),
     TestStatus.BLOCKED: "{test_id} was blocked ({error_code}). {error_detail}",
     TestStatus.CONFIG_ERROR: "{test_id} is misconfigured ({error_code}). {error_detail}",
     TestStatus.NOT_EXECUTED: "{test_id} was not executed. {error_detail}",

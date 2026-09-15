@@ -121,7 +121,7 @@ is no non-interactive source for a password, by design.
 | `--profile PATH` | **Required.** The TOML profile. |
 | `--workbook PATH` | Overrides `[workbook] path`. A path given here must exist. |
 | `--sheet NAME` | Overrides `[workbook] sheet`. Defaults to `Test Cases`. |
-| `--dry-run` | Validate everything; open no database, run no SQL, write no file. |
+| `--dry-run` | Validate the workbook offline; open no database, run no SQL, write no file. The pre-execution SQL check needs a database, so a dry run does not make it. |
 | `--non-interactive` | Never prompt. Fail instead of asking. |
 | `--output-dir PATH` | Where the result workbook goes. Defaults to beside the input. |
 | `--no-write` | Run and report, but produce no result workbook. |
@@ -190,18 +190,58 @@ Under `SOURCE_TARGET`, a one-sided comparison such as `EXPECTED_ZERO` is applied
 to **both** executed values and both must satisfy it. Asserting on one of two
 executed values would let the other fail unread.
 
+### Two passes: validate everything, then execute everything
+
+`reconcile run` goes through the enabled rows twice, and the first pass executes
+nothing at all.
+
+**Pass 1 — validate.** Each connection the plan needs is opened, and every
+enabled query is handed to its own database to be *compiled*, not run: SQL
+Server is asked under `SET NOEXEC ON`, Oracle is asked to parse the statement.
+Both report a syntax error, an unknown table and a misspelled column, and
+neither reads a row. A query the database rejects makes its row
+`Status = SYNTAX ERROR`, `Error_Code = SYNTAX_ERROR`, with the sanitized message
+in `Error_Detail` and the result columns left empty. Every row is checked even
+after one has failed, so the workbook names all the broken rows at once.
+
+**The gate.** If pass 1 found nothing wrong, the run continues. If it found
+anything, it stops there: no reconciliation SQL is executed, every row that did
+validate is written as `NOT EXECUTED` naming the rows to fix, and the workbook
+is saved as usual. Exactly one result workbook is written either way — the save
+happens once, at whichever point the run ends.
+
+**Pass 2 — execute.** Only reached after a completely clean pass 1. This is the
+execute → normalize → compare → decide → word-it pipeline, unchanged.
+
+The gate is there because a half-executed reconciliation is the expensive kind
+of wrong: finding a typo in the last of two hundred rows, after a hundred and
+ninety-nine have already run, leaves a workbook that is part results and part
+damage report.
+
+Two things deliberately do **not** close the gate. A connection that never
+opened blocks only the rows that need it (`BLOCKED`) and leaves the other side's
+tests to run, exactly as before — a dead source says nothing about the target's
+SQL. And a check that could not be *made* at all — a server that refuses
+`SET NOEXEC ON`, a driver with no parse call — is reported as a run warning
+saying those queries went in unchecked, never as a syntax error: nothing was
+proven about that SQL either way.
+
 ### Statuses and error codes
 
-Eight statuses, and never more: `PASS`, `FAIL`, `PROFILED`, `ERROR`, `BLOCKED`,
-`CONFIG ERROR`, `NOT EXECUTED`, `DISABLED`. The specific reason lives in
-`Error_Code` and the platform that decided it, so a new failure mode never needs
-a new status:
+Nine statuses, and never more: `PASS`, `FAIL`, `PROFILED`, `ERROR`,
+`SYNTAX ERROR`, `BLOCKED`, `CONFIG ERROR`, `NOT EXECUTED`, `DISABLED`. The
+specific reason lives in `Error_Code` and the platform that decided it, so a new
+failure mode never needs a new status:
 
 ```text
 Status = ERROR         Platform = TARGET      Error_Code = QUERY_TIMEOUT
 Status = CONFIG ERROR  Platform = WORKBOOK    Error_Code = MISSING_SOURCE_SQL
 Status = FAIL          Platform = COMPARISON  Error_Code = VALUE_MISMATCH
+Status = SYNTAX ERROR  Platform = SOURCE      Error_Code = SYNTAX_ERROR
 ```
+
+`SYNTAX ERROR` is the one status that is not decided by executing anything: it
+comes from the validation pass above, and a row carrying it was never run.
 
 A run is never reported as an overall `PASS` while an enabled test is still
 `NOT EXECUTED`.
@@ -229,6 +269,10 @@ moved into place only once it has succeeded, so a crash cannot leave a
 half-written workbook. Under the default `Output_Mode = NEW_FILE` the input
 workbook is left byte-for-byte as it was.
 
+One run writes one workbook. A run stopped by the validation gate writes its
+workbook at that point — validation results only, with every result column
+empty — rather than writing one workbook per pass.
+
 ---
 
 ## What the framework does
@@ -238,6 +282,7 @@ workbook is left byte-for-byte as it was.
 | Schema | A TOML file maps stable semantic fields (`source_sql`, `status`, …) to the header text of one specific workbook. |
 | Read | Columns are found by header name, never by column letter. Disabled rows are skipped; malformed rows are reported without stopping the run. |
 | Guard | Each query must be a single read-only `SELECT` / `WITH` statement. |
+| Validate | Every enabled query is compiled by its own database without being executed. One that will not compile stops the run before any query is executed. |
 | Execute | Each query returns exactly one row and one column. Nothing else crosses the boundary. |
 | Compare | `equal`, `expected_zero` or `numeric_tolerance`, computed in Python. |
 | Write | Results go into a new `*_results_<timestamp>.xlsx`. Other sheets are preserved. |
@@ -469,10 +514,16 @@ Two entry points connect to live databases, and **section 1 below applies to
 both**:
 
 * `reconcile run` — the reconciliation template, with connections from a TOML
-  profile. See [Quick start](#quick-start-the-reconciliation-template).
+  profile. See [Quick start](#quick-start-the-reconciliation-template). This is
+  the entry point with the
+  [pre-execution validation gate](#two-passes-validate-everything-then-execute-everything):
+  every enabled query is compiled before any is executed.
 * `run_reconciliation.py` — the original runner, described in the rest of this
   section. It takes no connection arguments at all: it asks, one question at a
-  time, and will not move on until each answer is valid.
+  time, and will not move on until each answer is valid. It has **no** validation
+  gate: each query is checked offline by the SQL guard and then executed
+  immediately, so a query that will not compile is one `ERROR` row among results
+  that already ran.
 
 ```powershell
 uv run python run_reconciliation.py

@@ -246,6 +246,16 @@ DEMO_OBSERVATION_RULES: tuple[dict[str, str], ...] = (
     },
     {
         "Enabled": "Yes",
+        "Status": "SYNTAX ERROR",
+        "Platform": "ANY",
+        "Error_Code": "ANY",
+        "Observation_Template": (
+            "{test_id} was not executed: {platform} rejected its SQL before the run started. "
+            "{error_detail}"
+        ),
+    },
+    {
+        "Enabled": "Yes",
         "Status": "PROFILED",
         "Platform": "ANY",
         "Error_Code": "ANY",
@@ -265,7 +275,10 @@ _EXECUTOR_CONTRACT: tuple[str, ...] = (
     "7. Definition columns are never modified by a run.",
     "8. A disabled test never opens a connection and never runs SQL.",
     "9. Every query must be read-only and must return exactly one row and column.",
-    "10. No password, token or secret is ever stored in TOML, in this workbook, or in a log.",
+    "10. Every enabled query is compiled by its database before any query is run.",
+    "    A query that will not compile is SYNTAX ERROR and stops the whole run:",
+    "    either every test executes, or none does.",
+    "11. No password, token or secret is ever stored in TOML, in this workbook, or in a log.",
 )
 
 _CONVERSION_NOTES: tuple[str, ...] = (
