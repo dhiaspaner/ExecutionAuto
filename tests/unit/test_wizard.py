@@ -619,3 +619,80 @@ def test_a_profile_naming_a_sheet_this_workbook_lacks_falls_back_to_asking(
 
     assert result.sheet_name == "Fines"
     assert "is not in this workbook, so the question is being asked" in console.transcript
+
+
+# -- Oracle is a source engine only --------------------------------------
+
+
+def test_an_oracle_source_is_accepted(workbook: Path, sheets_of: Any) -> None:
+    """Oracle skips the certificate question and always uses a typed password."""
+    from migration_reconciliation.profile import parse_profile
+
+    document = profile_document()
+    document["workbook"]["path"] = str(workbook)
+    document["source"] = {
+        "type": "oracle",
+        "server": "legacy-ora.corp.local",
+        "port": 1521,
+        "database": "LEGACYPAY",
+        "username": "recon_reader",
+    }
+    console = ScriptedConsole([], [SOURCE_SECRET])
+
+    result = run_wizard(console.prompter(), profile=parse_profile(document), list_sheets=sheets_of)
+
+    assert console.prompts == []  # no certificate and no authentication question
+    assert result.source.database_type is DatabaseType.ORACLE
+    assert result.source.database == "LEGACYPAY"
+    assert result.source.password == SOURCE_SECRET
+    assert result.target.database_type is DatabaseType.SQLSERVER
+
+
+def test_an_explicit_oracle_target_is_rejected_before_any_question(
+    workbook: Path, sheets_of: Any
+) -> None:
+    from migration_reconciliation.profile import parse_profile
+
+    document = profile_document()
+    document["workbook"]["path"] = str(workbook)
+    document["target"] = {
+        "type": "oracle",
+        "server": "ora-new.corp.local",
+        "database": "MIGRATED",
+        "username": "svc_recon",
+    }
+    console = ScriptedConsole([], [])
+
+    with pytest.raises(ReconciliationError, match="available as a source only"):
+        run_wizard(console.prompter(), profile=parse_profile(document), list_sheets=sheets_of)
+
+    assert console.prompts == []
+    assert console.secret_prompts == []
+
+
+def test_a_target_inheriting_oracle_from_the_source_is_rejected(
+    workbook: Path, sheets_of: Any
+) -> None:
+    """A [target] with no type inherits the source engine; Oracle cannot stand."""
+    from migration_reconciliation.profile import parse_profile
+
+    document = profile_document()
+    document["workbook"]["path"] = str(workbook)
+    document["source"] = {
+        "type": "oracle",
+        "server": "legacy-ora.corp.local",
+        "database": "LEGACYPAY",
+        "username": "recon_reader",
+    }
+    document["target"] = {
+        "server": "sql-new.internal",
+        "database": "MigratedDb",
+        "authentication": "password",
+        "username": "svc_recon",
+    }
+    console = ScriptedConsole([], [])
+
+    with pytest.raises(ReconciliationError, match='Add type = "sqlserver"'):
+        run_wizard(console.prompter(), profile=parse_profile(document), list_sheets=sheets_of)
+
+    assert console.prompts == []

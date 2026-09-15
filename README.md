@@ -3,11 +3,14 @@
 A reusable framework for running data-migration reconciliation test cases that
 live in an Excel workbook.
 
-Each test case carries two queries — one for the legacy **source** (Oracle or
-SQL Server) and one for the migrated **target** (always SQL Server). Both return
-a single scalar. The framework compares them, decides PASS / FAIL / ERROR, and
-writes the outcome into a **new, timestamped copy** of the workbook. The
-original is never modified.
+Each test case carries a query for the legacy **source**, a query for the
+migrated **target**, or one of the two. Every query returns a single scalar. The
+framework compares what comes back, decides the outcome in Python, and writes it
+into a **new, timestamped copy** of the workbook. The original is never modified.
+
+Both engines are supported on either side: SQL Server through `pyodbc`, Oracle
+through `oracledb`. SQL is passed to the driver verbatim and never translated
+between dialects.
 
 New domains, entities and templates are added by editing Excel and TOML. They do
 not require a Python change.
@@ -20,26 +23,60 @@ There are three ways to run it:
 | `reconcile execute` | The offline command. Schema-driven, with scripted results from a TOML file and no database at all. Use it to validate a workbook or rehearse a run. |
 | `run_reconciliation.py` | The original interactive runner. Asks fifteen questions, connects to a real source and target, and executes a fixed-column workbook. |
 
-> Neither one accepts a password as an argument, reads a credential from a file
+> None of them accepts a password as an argument, reads a credential from a file
 > or an environment variable, or writes one anywhere. See [SECURITY.md](SECURITY.md).
 
 ---
 
 ## Quick start: the reconciliation template
 
-```bash
-# 1. Get a workbook whose columns match this executor exactly.
-uv run reconcile make-workbook Payments.xlsx
+Run these from the repository root. Every command is prefixed with `uv run`, so
+there is no environment to activate; the first one installs the project if it is
+not installed yet.
 
-# 2. Copy the profile and point it at your servers. It never holds a password.
-cp config/reconciliation_profile.example.toml run_profile.toml
+```powershell
+# 1. Install the project. Needed once, and after every git pull.
+uv sync
 
-# 3. Validate everything without opening a database.
-uv run reconcile run --profile run_profile.toml --dry-run
+# 2. Get a workbook whose columns match this executor exactly.
+#    Add --force to replace one you already made.
+uv run reconcile make-workbook ".\Payments.xlsx"
 
-# 4. Run it.
-uv run reconcile run --profile run_profile.toml
+# 3. Copy the example profile. It is yours to edit and never holds a password.
+Copy-Item ".\config\reconciliation_profile.example.toml" ".\run_profile.toml"
+
+# 4. Validate everything, opening no database at all.
+#    --workbook wins over [workbook] path, so this works before you edit anything.
+uv run reconcile run --profile ".\run_profile.toml" --workbook ".\Payments.xlsx" --dry-run
+
+# 5. Install the driver for the databases you are about to open.
+uv add pyodbc          # SQL Server, either side
+uv add oracledb        # only if a side is Oracle
+
+# 6. Run it for real against the servers the profile names.
+uv run reconcile run --profile ".\run_profile.toml" --workbook ".\Payments.xlsx"
 ```
+
+On macOS or Linux the same commands work with `cp` in place of `Copy-Item` and
+forward slashes in the paths.
+
+Steps 1–4 need no driver, no server and no credential, so they work on any
+machine. Step 4 is the one to repeat while you are setting up: it reads the
+workbook, validates every enabled test, reports what it would connect to, and
+stops.
+
+`pyodbc` also needs the **ODBC Driver 18 for SQL Server** installed on the
+machine — see [Run against real databases](#run-against-real-databases). Without
+it, step 6 reports every test as `BLOCKED` with `CONNECTION_FAILED` and a
+message naming what is missing, rather than failing obscurely.
+
+### Then edit the profile
+
+Open `run_profile.toml` and change two things:
+
+1. `[workbook] path` — where your workbook actually is. Once it is right you can
+   drop `--workbook` from the commands above.
+2. `[source]` and `[target]` — the servers and databases to reconcile.
 
 The profile is the only place a connection is configured:
 
@@ -47,6 +84,7 @@ The profile is the only place a connection is configured:
 version = "1.0"
 
 [workbook]
+# Optional. Until it is set, pass --workbook or answer the one question asked.
 path = "C:/Users/PC/Downloads/Payments.xlsx"
 sheet = "Test Cases"
 
@@ -67,8 +105,29 @@ trust_server_certificate = true
 authentication = "windows"
 ```
 
-Every key is optional: what is missing is asked for, one question at a time.
-Under `--non-interactive` nothing is asked, so everything needed must be there.
+Every key is optional: what is missing is asked for, one question at a time, and
+what is present is echoed on screen so you can see what the run assumed. A
+`[workbook] path` that no longer exists is a warning and a question, not a
+failure — a shared profile outliving a moved workbook is ordinary.
+
+Under `--non-interactive` nothing is asked at all, so everything needed must be
+in the file, and every connection must use `authentication = "windows"`. There
+is no non-interactive source for a password, by design.
+
+### The `run` flags
+
+| Flag | Effect |
+| --- | --- |
+| `--profile PATH` | **Required.** The TOML profile. |
+| `--workbook PATH` | Overrides `[workbook] path`. A path given here must exist. |
+| `--sheet NAME` | Overrides `[workbook] sheet`. Defaults to `Test Cases`. |
+| `--dry-run` | Validate everything; open no database, run no SQL, write no file. |
+| `--non-interactive` | Never prompt. Fail instead of asking. |
+| `--output-dir PATH` | Where the result workbook goes. Defaults to beside the input. |
+| `--no-write` | Run and report, but produce no result workbook. |
+
+Exit codes: `0` clean, `1` failures or errors (for a dry run, `1` means a test is
+misconfigured), `2` the run could not start, `130` interrupted.
 
 **A profile never contains a password.** Any key that looks like a secret —
 `password`, `pwd`, `secret`, `token`, `access_token`, `api_key` and their
@@ -406,9 +465,14 @@ is reported as `ERROR` on the `COMPARISON` side rather than being coerced.
 
 ## Run against real databases
 
-`run_reconciliation.py` executes a workbook against a live source and target.
-It takes no connection arguments at all: it asks, one question at a time, and
-will not move on until each answer is valid.
+Two entry points connect to live databases, and **section 1 below applies to
+both**:
+
+* `reconcile run` — the reconciliation template, with connections from a TOML
+  profile. See [Quick start](#quick-start-the-reconciliation-template).
+* `run_reconciliation.py` — the original runner, described in the rest of this
+  section. It takes no connection arguments at all: it asks, one question at a
+  time, and will not move on until each answer is valid.
 
 ```powershell
 uv run python run_reconciliation.py
@@ -416,8 +480,8 @@ uv run python run_reconciliation.py
 
 ### 1. Install the driver you need
 
-`pyodbc` is used for every SQL Server connection; `oracledb` only if a source is
-Oracle. Both are imported lazily, so the one you do not use never has to be
+`pyodbc` is used for every SQL Server connection; `oracledb` only for an Oracle
+one. Both are imported lazily, so the one you do not use never has to be
 installed.
 
 ```powershell

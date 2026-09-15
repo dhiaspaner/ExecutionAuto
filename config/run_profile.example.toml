@@ -14,17 +14,39 @@
 # ---------------------------------------------------------------------------
 # There is no `password` key and none will be added. A file containing one — or
 # `pwd`, `secret`, `token` or similar — is REJECTED, not quietly ignored, so a
-# mistake is loud rather than silent.
+# mistake is loud rather than silent. This holds for Oracle exactly as it does
+# for SQL Server: an Oracle password is typed at runtime behind a hidden prompt,
+# kept in memory for the run, and written nowhere.
 #
 # Two ways to avoid typing a password at all:
 #
 #   authentication = "windows"   The account already signed in to Windows
 #                                connects. Nothing is typed, stored or sent.
-#                                SQL Server only.
+#                                SQL Server only — Oracle has no equivalent.
 #
 #   authentication = "password"  A username lives here; the password is typed
 #                                at runtime with a hidden prompt, kept in memory
 #                                for the run, and never written anywhere.
+#
+# ---------------------------------------------------------------------------
+# ENGINES: which keys each one uses
+# ---------------------------------------------------------------------------
+# The key names are the same for both engines; only what they mean changes.
+#
+#   type = "sqlserver"                  type = "oracle"
+#   ------------------------------      ------------------------------
+#   server   hostname or IP             server   hostname or IP
+#   port     default 1433               port     default 1521
+#   database the database name          database the SERVICE NAME
+#   authentication "windows" or         authentication "password" only
+#                  "password"
+#   trust_server_certificate applies    trust_server_certificate is not used
+#
+# Oracle connects through the `oracledb` driver in its default thin mode, so no
+# Oracle Instant Client has to be installed on the machine.
+#
+# Oracle is a SOURCE engine only. The target is always SQL Server, and a
+# [target] saying type = "oracle" is rejected before any question is asked.
 
 version = "1.0"
 
@@ -39,19 +61,41 @@ sheet = "Payments"
 # ---------------------------------------------------------------------------
 # The legacy system being migrated FROM. Oracle or SQL Server.
 # ---------------------------------------------------------------------------
+# Taken from the tnsnames.ora entry "mohredr":
+#
+#   (ADDRESS = (PROTOCOL = TCP)(HOST = 10.230.1.196)(PORT = 1521))
+#   (CONNECT_DATA = (SERVER = DEDICATED)(SERVICE_NAME = mohredr))
+#
+# HOST becomes `server`, PORT becomes `port` and SERVICE_NAME becomes
+# `database`. SERVER = DEDICATED has no key here: the thin-mode driver builds
+# the EasyConnect descriptor 10.230.1.196:1521/mohredr and the listener picks
+# the server mode.
 [source]
 type = "oracle"                      # "oracle" or "sqlserver"
-server = "legacy-ora.corp.local"
+server = "10.230.1.196"              # Oracle host
 port = 1521                          # omit to accept 1521 for Oracle, 1433 for SQL Server
-database = "LEGACYPAY"               # the SERVICE NAME when type = "oracle"
+database = "mohredr"                 # the SERVICE NAME when type = "oracle"
 authentication = "password"          # Oracle supports "password" only
-username = "recon_reader"            # omit under Windows authentication
-# trust_server_certificate = true    # SQL Server sources only
+username = "younes_qpro"             # the password is asked for at runtime
+# trust_server_certificate = true    # SQL Server sources only; ignored by Oracle
+
+# A SQL Server source instead — delete the [source] block above and uncomment
+# this one. Same keys, different meanings, and "windows" becomes available.
+#
+# [source]
+# type = "sqlserver"
+# server = "sql-legacy.corp.local"
+# port = 1433
+# database = "LegacyPayments"
+# trust_server_certificate = true
+# authentication = "windows"         # or "password", with a username below
+# # username = "recon_reader"
 
 # ---------------------------------------------------------------------------
-# The migrated system being reconciled TO. State the engine explicitly: if
-# `type` is missing it is inherited from [source] for backward compatibility,
-# and a warning says so.
+# The migrated system being reconciled TO. Always SQL Server. State the engine
+# explicitly: if `type` is missing it is inherited from [source] for backward
+# compatibility, and a warning says so — and an inherited "oracle" is an error,
+# because this side cannot be Oracle.
 # ---------------------------------------------------------------------------
 [target]
 type = "sqlserver"

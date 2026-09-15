@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "openpyxl>=3.1",
+    "oracledb>=2.0",
 ]
 
 [project.scripts]

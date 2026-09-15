@@ -185,3 +185,87 @@ def test_a_target_type_inherited_from_the_source_is_announced(
     main(["run", "--profile", str(inheriting), "--workbook", str(workbook), "--dry-run"])
 
     assert 'no "type"' in capsys.readouterr().out
+
+
+def test_a_profile_path_that_moved_is_asked_about_rather_than_fatal(
+    tmp_path: Path,
+    make_recon_workbook: Any,
+    test_row: Any,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared profile outliving a moved workbook is ordinary, not an error."""
+    stale = tmp_path / "stale.toml"
+    stale.write_text(
+        WINDOWS_PROFILE.replace(
+            '[workbook]\nsheet = "Test Cases"',
+            '[workbook]\npath = "C:/nowhere/Payments.xlsx"\nsheet = "Test Cases"',
+        ),
+        encoding="utf-8",
+    )
+    workbook = make_recon_workbook([test_row("TC-001")])
+    monkeypatch.setattr("builtins.input", lambda _prompt: str(workbook))
+
+    code = main(["run", "--profile", str(stale), "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "which is not there" in out
+    assert "enabled tests : 1" in out
+
+
+def test_a_profile_path_that_moved_is_fatal_when_nothing_can_be_asked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stale = tmp_path / "stale.toml"
+    stale.write_text(
+        WINDOWS_PROFILE.replace(
+            '[workbook]\nsheet = "Test Cases"',
+            '[workbook]\npath = "C:/nowhere/Payments.xlsx"\nsheet = "Test Cases"',
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(["run", "--profile", str(stale), "--non-interactive", "--dry-run"])
+
+    assert code == EXIT_USAGE
+    assert "--workbook" in capsys.readouterr().err
+
+
+def test_an_explicit_workbook_that_is_missing_is_never_second_guessed(
+    profile_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(["run", "--profile", str(profile_path), "--workbook", str(tmp_path / "typo.xlsx")])
+
+    assert code == EXIT_USAGE
+    assert "Workbook not found" in capsys.readouterr().err
+
+
+def test_a_dry_run_reports_validation_not_a_run(
+    profile_path: Path, make_recon_workbook: Any, test_row: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two hundred identical "not executed" lines would bury the real findings."""
+    workbook = make_recon_workbook([test_row(f"TC-{n:03d}") for n in range(1, 6)])
+
+    main(["run", "--profile", str(profile_path), "--workbook", str(workbook), "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert "5 test(s) validated and ready to run" in out
+    assert "no database was opened" in out
+    assert "NOT EXECUTED" not in out
+    assert "Overall:" not in out
+
+
+def test_a_dry_run_lists_only_the_rows_with_something_wrong(
+    profile_path: Path, make_recon_workbook: Any, test_row: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workbook = make_recon_workbook(
+        [test_row("TC-001"), test_row("TC-BAD", Result_Type="MONEY")], name="mixed.xlsx"
+    )
+
+    main(["run", "--profile", str(profile_path), "--workbook", str(workbook), "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert "1 misconfigured" in out
+    assert "TC-BAD" in out
+    assert "Fix the rows above" in out

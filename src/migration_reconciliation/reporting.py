@@ -11,7 +11,7 @@ import contextlib
 import sys
 from typing import TYPE_CHECKING
 
-from .models import ConnectionIdentity, RunSummary
+from .models import ConnectionIdentity, RunSummary, TestStatus
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime only
     from .execution.engine import RunReport
@@ -87,6 +87,9 @@ def render_run_report(report: RunReport, *, no_output_note: str) -> list[str]:
     Deliberately the same shape as :func:`render_summary`: the two entry points
     produce reports a person can read side by side.
     """
+    if report.dry_run:
+        return _render_dry_run(report)
+
     lines = ["", f"Run {report.run_id} - {report.workbook_path.name}", "-" * RULE_WIDTH]
     for outcome in report.outcomes:
         platform = f" [{outcome.platform.value}]" if outcome.platform.value else ""
@@ -111,4 +114,40 @@ def render_run_report(report: RunReport, *, no_output_note: str) -> list[str]:
     if report.overall_status != "PASS":
         lines.append("")
         lines.append("  Review every row above that is not PASS before signing off the migration.")
+    return lines
+
+
+def _render_dry_run(report: RunReport) -> list[str]:
+    """A validation report, not a run report.
+
+    Listing two hundred identical "not executed" rows would bury the handful of
+    rows that actually have something to say, so a dry run reports only what it
+    found wrong and how much it found right.
+    """
+    lines = ["", f"Dry run {report.run_id} - {report.workbook_path.name}", "-" * RULE_WIDTH]
+    notable = [
+        outcome
+        for outcome in report.outcomes
+        if outcome.status not in {TestStatus.NOT_EXECUTED, TestStatus.DISABLED}
+    ]
+    for outcome in notable:
+        platform = f" [{outcome.platform.value}]" if outcome.platform.value else ""
+        code = f" {outcome.error_code}" if outcome.error_code else ""
+        lines.append(
+            f"  {outcome.status.value:<12} {outcome.test_id:<14} "
+            f"row {outcome.row_number:<4}{platform}{code}  {outcome.error_detail}"
+        )
+    if notable:
+        lines.append("-" * RULE_WIDTH)
+
+    ready = report.not_executed
+    misconfigured = report.blocked_error
+    lines.append(
+        f"  {ready} test(s) validated and ready to run, "
+        f"{misconfigured} misconfigured, {report.disabled} disabled"
+    )
+    lines.append("  Nothing was executed, nothing was written, no database was opened.")
+    if misconfigured:
+        lines.append("")
+        lines.append("  Fix the rows above, then run the dry run again.")
     return lines

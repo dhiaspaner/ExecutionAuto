@@ -233,6 +233,7 @@ def run_wizard(
     """
     ask = prompter or Prompter()
     supplied = profile or RunProfile.empty()
+    _reject_oracle_target(supplied)
     read_sheets = list_sheets or sheet_names_of
     ask.set_total(_expected_total(supplied))
 
@@ -326,6 +327,26 @@ def run_wizard(
 
 
 # -- one question each, profile first -----------------------------------------
+
+
+def _reject_oracle_target(profile: RunProfile) -> None:
+    """Refuse a profile whose target is Oracle, before a single question is asked.
+
+    The target this wizard builds is always SQL Server, so a profile naming
+    Oracle there would otherwise be quietly ignored and the run would connect to
+    an engine the file never asked for. Oracle is a source engine only.
+    """
+    if profile.target.database_type is not DatabaseType.ORACLE:
+        return
+    if profile.target_type_inherited:
+        raise ReconciliationError(
+            f'{profile.source_path}: [target] has no "type", so it inherited "oracle" from '
+            '[source], but the target is always SQL Server. Add type = "sqlserver" to [target].'
+        )
+    raise ReconciliationError(
+        f'{profile.source_path}: [target] type = "oracle" is not supported. Oracle is '
+        "available as a source only; the target is always SQL Server."
+    )
 
 
 def _workbook_from_profile(ask: Prompter, profile: RunProfile) -> Path | None:

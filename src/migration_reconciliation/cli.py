@@ -337,17 +337,37 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _workbook_path(args: argparse.Namespace, profile: RunProfile, prompter: Prompter) -> Path:
-    """The workbook to run: the flag, then the profile, then a question."""
-    for candidate in (args.workbook, profile.workbook_path):
-        if candidate is not None:
-            path = Path(candidate).expanduser()
-            if path.is_file():
-                return path
+    """The workbook to run: the flag, then the profile, then a question.
+
+    A ``--workbook`` that is not there is a hard error: the person named that
+    exact file. A *profile* path that is not there is not — a shared profile
+    outliving a moved workbook is ordinary, so it warns and asks instead, which
+    is what the interactive runner has always done.
+    """
+    if args.workbook is not None:
+        path = Path(args.workbook).expanduser()
+        if not path.is_file():
             raise ReconciliationError(f"Workbook not found: {path}")
-    if args.non_interactive:
+        return path
+
+    if profile.workbook_path is not None:
+        path = Path(profile.workbook_path).expanduser()
+        if path.is_file():
+            return path
+        if args.non_interactive:
+            raise ReconciliationError(
+                f"Workbook not found: {path}. Fix [workbook] path in "
+                f"'{profile.source_path}', or pass --workbook."
+            )
+        _emit(
+            f"  warning: [workbook] path in '{profile.source_path}' is '{path}', "
+            f"which is not there. Asking instead."
+        )
+    elif args.non_interactive:
         raise ReconciliationError(
             "No workbook was given. Set [workbook] path in the profile or pass --workbook."
         )
+
     prompter.set_total(1)
     return prompter.existing_workbook("Path to the workbook (.xlsx)")
 
