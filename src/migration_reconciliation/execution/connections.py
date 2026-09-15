@@ -136,6 +136,8 @@ def _settings_for(
         password=password,
         auth_mode=auth,
         trust_server_certificate=trust,
+        use_thick_client=supplied.use_thick_client,
+        oracle_client_dir=supplied.oracle_client_dir or "",
     )
 
 

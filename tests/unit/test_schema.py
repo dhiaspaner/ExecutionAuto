@@ -9,11 +9,11 @@ import pytest
 from migration_reconciliation.errors import SchemaError
 from migration_reconciliation.models import FieldType
 from migration_reconciliation.workbook.schema import load_schema, parse_schema
-from tests.conftest import EXAMPLE_SCHEMA_PATH
+from tests.conftest import GENERIC_SCHEMA_PATH
 
 
 def test_loads_the_shipped_example_schema() -> None:
-    schema = load_schema(EXAMPLE_SCHEMA_PATH)
+    schema = load_schema(GENERIC_SCHEMA_PATH)
 
     assert schema.schema_version == "1.0"
     assert schema.profile_name == "default-reconciliation"

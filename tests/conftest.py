@@ -25,19 +25,21 @@ from migration_reconciliation.workbook.schema import parse_schema
 from migration_reconciliation.workbook.template import write_template
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-EXAMPLE_SCHEMA_PATH = REPO_ROOT / "config" / "workbook_schema.example.toml"
+#: The generic schema the suite is built on. It is a test fixture, not a
+#: shipped config file: config/ carries only the schema real runs use.
+GENERIC_SCHEMA_PATH = REPO_ROOT / "tests" / "fixtures" / "workbook_schema.generic.toml"
 EXAMPLE_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "fake_results.toml"
 EXAMPLE_TEMPLATE_PATH = REPO_ROOT / "templates" / "reconciliation_template.xlsx"
 
 
 @pytest.fixture
 def schema_document() -> dict[str, Any]:
-    """A mutable copy of the shipped example schema.
+    """A mutable copy of the generic schema fixture.
 
-    Tests mutate this to produce invalid variants, which also keeps the shipped
-    example honest: if it ever stops being valid, most of the suite fails.
+    Tests mutate this to produce invalid variants, which also keeps the fixture
+    honest: if it ever stops being valid, most of the suite fails.
     """
-    return copy.deepcopy(tomllib.loads(EXAMPLE_SCHEMA_PATH.read_text(encoding="utf-8")))
+    return copy.deepcopy(tomllib.loads(GENERIC_SCHEMA_PATH.read_text(encoding="utf-8")))
 
 
 @pytest.fixture

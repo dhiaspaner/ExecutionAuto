@@ -4,8 +4,17 @@
 nobody has to install it — or an Oracle Client — unless they actually choose an
 Oracle source.
 
-The driver's default *thin* mode is used: it speaks the wire protocol directly
-and needs no Oracle Instant Client on the machine.
+The driver's default *thin* mode speaks the wire protocol directly and needs no
+Oracle Instant Client on the machine, but it only reaches Oracle Database 12.1
+and later. An older server answers a thin connection with ``DPY-3010``.
+
+So thick mode is the default here: :attr:`ConnectionSettings.uses_thick_client`
+loads the Oracle Client library instead, which reaches back to Oracle Database
+9.2. A profile opts back out with ``oracle_client_mode = "thin"``. That library has to
+be installed separately, and the Instant Client release must itself be old
+enough to talk to the server: a 19c client reaches 11.2, and only an older
+client reaches 9.2. Thick mode is a process-wide switch, so it is started once
+and shared by every Oracle connection in the run.
 
 Oracle spells its timeouts differently from ODBC:
 
@@ -54,6 +63,8 @@ class OracleExecutor:
             return
         module = self._load_driver()
         settings = self._settings
+        if settings.uses_thick_client:
+            _start_thick_mode(module, settings.oracle_client_dir)
         try:
             self._connection = module.connect(
                 user=settings.username,
@@ -155,6 +166,45 @@ class OracleExecutor:
             return str(getattr(self._connection, "version", "") or "")
         except Exception:
             return ""
+
+
+#: Thick mode can only be started once per process, so the first Oracle
+#: connection that asks for it does the work and the rest inherit it.
+_thick_mode_started = False
+
+
+def _start_thick_mode(module: Any, client_dir: str) -> None:
+    """Load the Oracle Client library, once, before the first connection.
+
+    A failure here means the library is missing or unusable, so it is reported
+    as a connection failure rather than left to surface as a puzzling error on
+    ``connect``. The directory is named in the message because a wrong path is
+    the usual cause; it is a path, never a credential.
+    """
+    global _thick_mode_started
+    if _thick_mode_started:
+        return
+    try:
+        if client_dir:
+            module.init_oracle_client(lib_dir=client_dir)
+        else:
+            module.init_oracle_client()
+    except Exception as exc:
+        if not _already_started(exc):
+            where = f"'{client_dir}'" if client_dir else "the system library path"
+            raise ConnectionFailedError(
+                "Thick mode was requested but the Oracle Client library could not be "
+                f"loaded from {where}, so no connection was attempted. Install Oracle "
+                "Instant Client and point oracle_client_dir at it. "
+                f"Driver reported: {sanitize_error(exc, max_length=200)}"
+            ) from None
+    _thick_mode_started = True
+
+
+def _already_started(exc: BaseException) -> bool:
+    """True when thick mode was already enabled by an earlier connection."""
+    text = str(exc).casefold()
+    return "already" in text and ("enabled" in text or "initialized" in text)
 
 
 def _restore_call_timeout(connection: Any, previous: Any) -> None:

@@ -279,3 +279,53 @@ def test_invalid_toml_is_reported_clearly(tmp_path: Path) -> None:
 
     with pytest.raises(ReconciliationError, match="not valid TOML"):
         load_profile(bad)
+
+
+# -- Oracle client mode --------------------------------------------------
+
+
+def test_thick_mode_is_read_from_the_profile() -> None:
+    doc = document()
+    doc["source"]["oracle_client_mode"] = "thick"
+    doc["source"]["oracle_client_dir"] = "/opt/oracle/instantclient_19_8"
+
+    profile = parse_profile(doc)
+
+    assert profile.source.use_thick_client is True
+    assert profile.source.oracle_client_dir == "/opt/oracle/instantclient_19_8"
+
+
+def test_thin_mode_is_read_from_the_profile() -> None:
+    doc = document()
+    doc["source"]["oracle_client_mode"] = "thin"
+
+    assert parse_profile(doc).source.use_thick_client is False
+
+
+def test_an_absent_client_mode_stays_unset() -> None:
+    assert parse_profile(document()).source.use_thick_client is None
+
+
+def test_an_unknown_client_mode_is_rejected() -> None:
+    doc = document()
+    doc["source"]["oracle_client_mode"] = "fat"
+
+    with pytest.raises(ReconciliationError, match="oracle_client_mode must be one of"):
+        parse_profile(doc)
+
+
+def test_a_client_mode_on_a_sql_server_section_is_rejected() -> None:
+    doc = document()
+    doc["target"]["oracle_client_mode"] = "thick"
+
+    with pytest.raises(ReconciliationError, match='type = "oracle" only'):
+        parse_profile(doc)
+
+
+def test_a_client_directory_without_thick_mode_is_rejected() -> None:
+    """A directory that would never be loaded is a mistake worth naming."""
+    doc = document()
+    doc["source"]["oracle_client_dir"] = "/opt/oracle/instantclient_19_8"
+
+    with pytest.raises(ReconciliationError, match="only used in thick mode"):
+        parse_profile(doc)

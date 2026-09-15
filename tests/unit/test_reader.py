@@ -13,11 +13,11 @@ from migration_reconciliation.errors import WorkbookError
 from migration_reconciliation.models import ComparisonRule, DatabaseType, WorkbookSchema
 from migration_reconciliation.workbook.reader import read_workbook, validate_workbook
 from migration_reconciliation.workbook.schema import load_schema, parse_schema
-from tests.conftest import EXAMPLE_SCHEMA_PATH, EXAMPLE_TEMPLATE_PATH
+from tests.conftest import EXAMPLE_TEMPLATE_PATH, GENERIC_SCHEMA_PATH
 
 
 def test_reads_the_shipped_template() -> None:
-    schema = load_schema(EXAMPLE_SCHEMA_PATH)
+    schema = load_schema(GENERIC_SCHEMA_PATH)
 
     read = read_workbook(EXAMPLE_TEMPLATE_PATH, schema)
 

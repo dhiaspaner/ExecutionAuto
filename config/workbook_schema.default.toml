@@ -1,0 +1,208 @@
+# Workbook schema DSL for the "payments_reconciliation_automation_toml_v1.xlsx"
+# template — sheet "Test Cases": rows 1-3 are a title banner and section
+# labels, real headers are on row 4, data starts row 5.
+#
+# This file is DATA ONLY (parsed with tomllib). No Python, shell, Excel
+# formula or SQL expression in it is ever evaluated. Never put credentials or
+# connection strings in a schema file.
+#
+# Known gaps versus this template, left for a human decision rather than
+# guessed silently:
+#   - The template has both Absolute_Tolerance and Percentage_Tolerance, but
+#     the framework's `tolerance` field is a single number used only by the
+#     numeric_tolerance rule (abs(source - target) <= tolerance). This schema
+#     maps `tolerance` to Absolute_Tolerance; Percentage_Tolerance is not read
+#     or enforced.
+#   - The template has separate Source_Duration_ms / Target_Duration_ms, but
+#     the framework writes one aggregate `duration_ms` per test case. This
+#     schema writes it to Source_Duration_ms; Target_Duration_ms is left blank.
+#   - There is no "Error Side" column in the template, so `error_side` (a
+#     mandatory write field) is declared with a header that does not exist in
+#     the sheet and is required = false, so it is simply never written.
+#   - There is no "Source DB Type" column, so `source_type` (a mandatory read
+#     field) always falls back to its default ("sqlserver"), matching this
+#     domain's queries (T-SQL: DATEADD, COUNT_BIG, CAST(... AS date)).
+#   - Decorative/tracking-only template columns (Test_Name, Execution_Scope,
+#     Result_Type, Source_Object, Target_Object, Owner, Tags, Actual_Value,
+#     Variance_Percentage, Evidence_Path) are not mapped to anything; the
+#     framework has no semantic field for them.
+
+schema_version = "1.0"
+profile_name = "payments-toml-v1"
+
+[workbook]
+test_case_sheet = "Test Cases"
+header_row = 4
+first_data_row = 5
+preserve_other_sheets = true
+output_filename_pattern = "{input_stem}_results_{timestamp}.xlsx"
+
+# --------------------------------------------------------------------------
+# Input fields (read = true). The framework never writes to these.
+# --------------------------------------------------------------------------
+
+[fields.test_case_id]
+header = "Test_ID"
+type = "string"
+required = true
+read = true
+
+[fields.enabled]
+header = "Enabled"
+type = "boolean"
+required = false
+default = true
+read = true
+
+[fields.domain]
+header = "Domain"
+type = "string"
+required = false
+read = true
+
+[fields.entity]
+header = "Flow"
+type = "string"
+required = false
+read = true
+
+[fields.severity]
+header = "Severity"
+type = "string"
+required = false
+read = true
+
+[fields.expected_result]
+header = "Expected_Value"
+type = "string"
+required = false
+read = true
+
+# No "Source DB Type" column in this template; always falls back to the
+# default below. The header text is a sentinel that cannot match a real
+# column.
+[fields.source_type]
+header = "(not present in template — defaults to sqlserver)"
+type = "enum"
+allowed_values = ["oracle", "sqlserver"]
+required = false
+default = "sqlserver"
+read = true
+
+[fields.source_connection]
+header = "Source_Profile_Section"
+type = "string"
+required = true
+read = true
+
+[fields.target_connection]
+header = "Target_Profile_Section"
+type = "string"
+required = true
+read = true
+
+[fields.source_sql]
+header = "Source_SQL"
+type = "sql"
+required = true
+read = true
+
+[fields.target_sql]
+header = "Target_SQL"
+type = "sql"
+required = true
+read = true
+
+[fields.comparison_rule]
+header = "Comparison_Type"
+type = "enum"
+allowed_values = ["equal", "expected_zero", "numeric_tolerance"]
+required = false
+default = "equal"
+read = true
+
+[fields.tolerance]
+header = "Absolute_Tolerance"
+type = "decimal"
+required = false
+default = 0
+read = true
+
+# No "Timeout Seconds" column in this template; always falls back to the
+# default below.
+[fields.timeout_seconds]
+header = "(not present in template — defaults to 120s)"
+type = "integer"
+required = false
+default = 120
+read = true
+
+# --------------------------------------------------------------------------
+# Result fields (write = true). Only these cells are ever written.
+# --------------------------------------------------------------------------
+
+[fields.source_result]
+header = "Source_Result"
+type = "scalar"
+required = true
+write = true
+
+[fields.target_result]
+header = "Target_Result"
+type = "scalar"
+required = true
+write = true
+
+[fields.variance]
+header = "Variance"
+type = "decimal"
+required = true
+write = true
+
+[fields.status]
+header = "Status"
+type = "enum"
+allowed_values = ["PASS", "FAIL", "ERROR", "SKIPPED"]
+required = true
+write = true
+
+[fields.remarks]
+header = "Observation"
+type = "string"
+required = true
+write = true
+
+[fields.executed_at]
+header = "Executed_At_UTC"
+type = "datetime"
+format = "yyyy-mm-dd hh:mm:ss"
+timezone = "UTC"
+required = true
+write = true
+
+[fields.run_id]
+header = "Run_ID"
+type = "string"
+required = true
+write = true
+
+[fields.duration_ms]
+header = "Source_Duration_ms"
+type = "integer"
+required = false
+write = true
+
+# No "Error Side" column in this template; a sentinel header means this is
+# always skipped on write rather than raising a missing-column error.
+[fields.error_side]
+header = "(not present in template — never written)"
+type = "enum"
+allowed_values = ["SOURCE", "TARGET", "COMPARISON", "WORKBOOK", ""]
+required = false
+write = true
+
+[fields.error_code]
+header = "Error_Code"
+type = "string"
+required = false
+write = true

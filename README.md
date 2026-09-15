@@ -295,7 +295,7 @@ connects to nothing.
 
 ```powershell
 uv run reconcile validate-schema `
-    --schema ".\config\workbook_schema.example.toml"
+    --schema ".\config\workbook_schema.default.toml"
 ```
 
 This checks the schema version, the sheet geometry, that every mandatory
@@ -308,7 +308,7 @@ and that the output filename pattern cannot overwrite the input workbook.
 ```powershell
 uv run reconcile validate-template `
     ".\templates\reconciliation_template.xlsx" `
-    --schema ".\config\workbook_schema.example.toml"
+    --schema ".\config\workbook_schema.default.toml"
 ```
 
 This confirms the sheet exists, every required column is present, test-case ids
@@ -320,7 +320,7 @@ row is malformed, listing the row numbers.
 ```powershell
 uv run reconcile execute `
     ".\templates\reconciliation_template.xlsx" `
-    --schema ".\config\workbook_schema.example.toml" `
+    --schema ".\config\workbook_schema.default.toml" `
     --fake-results ".\tests\fixtures\fake_results.toml"
 ```
 
@@ -343,19 +343,19 @@ Useful variations:
 ```powershell
 # One named test case
 uv run reconcile execute ".\templates\reconciliation_template.xlsx" `
-    --schema ".\config\workbook_schema.example.toml" `
+    --schema ".\config\workbook_schema.default.toml" `
     --case "TC-PAY-008" `
     --fake-results ".\tests\fixtures\fake_results.toml"
 
 # A two-case pilot
 uv run reconcile execute ".\templates\reconciliation_template.xlsx" `
-    --schema ".\config\workbook_schema.example.toml" `
+    --schema ".\config\workbook_schema.default.toml" `
     --limit 2 `
     --fake-results ".\tests\fixtures\fake_results.toml"
 
 # Stop at the first problem, and put the output somewhere specific
 uv run reconcile execute ".\templates\reconciliation_template.xlsx" `
-    --schema ".\config\workbook_schema.example.toml" `
+    --schema ".\config\workbook_schema.default.toml" `
     --fail-fast --output-dir ".\out" `
     --fake-results ".\tests\fixtures\fake_results.toml"
 ```
@@ -384,10 +384,10 @@ in the same second, the second filename also carries the run id
 
 No Python changes are needed — this is the point of the design.
 
-1. **Copy the example.**
+1. **Copy the shipped schema.**
 
    ```powershell
-   Copy-Item .\config\workbook_schema.example.toml .\config\fines_schema.toml
+   Copy-Item .\config\workbook_schema.default.toml .\config\fines_schema.toml
    ```
 
 2. **Point it at your sheet.**
@@ -406,7 +406,7 @@ No Python changes are needed — this is the point of the design.
 
    ```toml
    [fields.test_case_id]
-   header = "Scenario Ref"   # was "Test Case ID"
+   header = "Scenario Ref"   # was "Test_ID"
    type = "string"
    required = true
    read = true

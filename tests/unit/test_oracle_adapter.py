@@ -206,3 +206,128 @@ def test_a_missing_oracledb_is_explained_rather_than_traced(
 
     with pytest.raises(DatabaseExecutionError, match="oracledb is not installed"):
         executor.connect()
+
+
+# -- thick mode: for servers older than thin mode supports --------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_thick_mode() -> Any:
+    """Thick mode is process-wide, so each test starts from a clean slate."""
+    from migration_reconciliation.database import oracle as oracle_module
+
+    oracle_module._thick_mode_started = False
+    yield
+    oracle_module._thick_mode_started = False
+
+
+def test_oracle_loads_the_client_by_default() -> None:
+    """Thick is the engine default: an unconfigured run reaches an old server."""
+    driver = FakeOracleDb()
+
+    OracleExecutor(settings(), driver=driver).connect()
+
+    assert driver.init_calls == [{}]
+
+
+def test_thin_mode_can_still_be_asked_for() -> None:
+    driver = FakeOracleDb()
+
+    OracleExecutor(settings(use_thick_client=False), driver=driver).connect()
+
+    assert driver.init_calls == []
+
+
+def test_sql_server_never_loads_the_oracle_client() -> None:
+    """The default is per-engine, so it must not leak into SQL Server."""
+    from migration_reconciliation.database.settings import ConnectionSettings
+
+    sqlserver = ConnectionSettings(
+        side=QuerySide.SOURCE,
+        database_type=DatabaseType.SQLSERVER,
+        server="sql.internal",
+        port=1433,
+        database="Db",
+        username="u",
+        password=SECRET,
+    )
+
+    assert sqlserver.uses_thick_client is False
+    assert sqlserver.oracle_client_mode == "thin"
+
+
+def test_thick_mode_loads_the_client_from_the_configured_directory() -> None:
+    driver = FakeOracleDb()
+    executor = OracleExecutor(
+        settings(use_thick_client=True, oracle_client_dir="/opt/oracle/instantclient_19_8"),
+        driver=driver,
+    )
+
+    executor.connect()
+
+    assert driver.init_calls == [{"lib_dir": "/opt/oracle/instantclient_19_8"}]
+    assert driver.connect_kwargs["dsn"] == "legacy-ora.internal:1521/LEGACYSVC"
+
+
+def test_thick_mode_without_a_directory_lets_the_driver_find_the_client() -> None:
+    driver = FakeOracleDb()
+
+    OracleExecutor(settings(use_thick_client=True), driver=driver).connect()
+
+    assert driver.init_calls == [{}]
+
+
+def test_the_client_is_loaded_only_once_per_process() -> None:
+    first, second = FakeOracleDb(), FakeOracleDb()
+
+    OracleExecutor(settings(use_thick_client=True), driver=first).connect()
+    OracleExecutor(settings(use_thick_client=True), driver=second).connect()
+
+    assert first.init_calls == [{}]
+    assert second.init_calls == []  # the process-wide switch was already on
+
+
+def test_a_missing_oracle_client_is_reported_before_connecting() -> None:
+    driver = FakeOracleDb(init_error=RuntimeError("DPI-1047: cannot locate libclntsh.so"))
+    executor = OracleExecutor(
+        settings(use_thick_client=True, oracle_client_dir="/wrong/path"), driver=driver
+    )
+
+    with pytest.raises(DatabaseExecutionError, match="Oracle Client library could not be loaded"):
+        executor.connect()
+
+    assert driver.connections == []  # nothing was attempted
+
+
+def test_the_failure_message_names_the_directory_but_never_the_password() -> None:
+    driver = FakeOracleDb(init_error=RuntimeError("DPI-1047: cannot locate libclntsh.so"))
+    executor = OracleExecutor(
+        settings(use_thick_client=True, oracle_client_dir="/wrong/path"), driver=driver
+    )
+
+    with pytest.raises(DatabaseExecutionError) as caught:
+        executor.connect()
+
+    assert "/wrong/path" in str(caught.value)
+    assert SECRET not in str(caught.value)
+
+
+def test_an_already_enabled_client_is_not_an_error() -> None:
+    """A second process-wide init is tolerated, not turned into a failure."""
+    from migration_reconciliation.database import oracle as oracle_module
+
+    oracle_module._thick_mode_started = False
+    driver = FakeOracleDb(
+        init_error=RuntimeError("DPY-2019: python-oracledb thick mode has already been enabled")
+    )
+
+    OracleExecutor(settings(use_thick_client=True), driver=driver).connect()
+
+    assert driver.connections != []
+
+
+def test_thick_mode_is_rejected_for_sql_server() -> None:
+    from migration_reconciliation.errors import ReconciliationError
+
+    with pytest.raises(ReconciliationError, match="Oracle connections only"):
+        settings(database_type=DatabaseType.SQLSERVER, use_thick_client=True)

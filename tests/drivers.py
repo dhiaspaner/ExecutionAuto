@@ -178,8 +178,17 @@ class FakeOracleDb:
     connection: FakeConnection | None = None
     connections: list[FakeConnection] = field(default_factory=list)
     connect_kwargs: dict[str, Any] = field(default_factory=dict)
+    #: Every init_oracle_client call, so a test can prove thick mode was
+    #: started once, with the directory the profile asked for.
+    init_calls: list[dict[str, Any]] = field(default_factory=list)
+    init_error: Exception | None = None
 
     DatabaseError = FakeOracleError
+
+    def init_oracle_client(self, **kwargs: Any) -> None:
+        self.init_calls.append(kwargs)
+        if self.init_error is not None:
+            raise self.init_error
 
     def connect(self, **kwargs: Any) -> FakeConnection:
         self.connect_kwargs = kwargs

@@ -262,6 +262,8 @@ def run_wizard(
     ask.set_total(_expected_total(supplied, source_type=source_type))
     if source_type is DatabaseType.ORACLE:
         ask.say("      Oracle uses a username and password; no certificate question applies.")
+        if supplied.source.use_thick_client is not None:
+            ask.supplied("Source Oracle client mode", _client_mode_label(supplied.source))
 
     source_server = _server(ask, supplied.source, "Source server (hostname or IP)")
     source_port = _port(ask, supplied.source, "Source port", source_type)
@@ -306,6 +308,8 @@ def run_wizard(
         password=source_password,
         auth_mode=source_auth,
         trust_server_certificate=source_trust,
+        use_thick_client=supplied.source.use_thick_client,
+        oracle_client_dir=supplied.source.oracle_client_dir or "",
     )
     target = ConnectionSettings(
         side=QuerySide.TARGET,
@@ -327,6 +331,14 @@ def run_wizard(
 
 
 # -- one question each, profile first -----------------------------------------
+
+
+def _client_mode_label(profile: ConnectionProfile) -> str:
+    """How the Oracle client mode reads on screen, including where it loads from."""
+    if not profile.use_thick_client:
+        return "thin (no Oracle Client needed; Oracle Database 12.1 and later)"
+    where = profile.oracle_client_dir or "the system library path"
+    return f"thick, loading the Oracle Client from {where}"
 
 
 def _reject_oracle_target(profile: RunProfile) -> None:

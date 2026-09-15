@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from migration_reconciliation.cli import EXIT_FAILURES, EXIT_OK, EXIT_USAGE, main
-from tests.conftest import EXAMPLE_FIXTURE_PATH, EXAMPLE_SCHEMA_PATH, EXAMPLE_TEMPLATE_PATH
+from tests.conftest import EXAMPLE_FIXTURE_PATH, EXAMPLE_TEMPLATE_PATH, GENERIC_SCHEMA_PATH
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def fixture_file(tmp_path: Path) -> Any:
 
 
 def test_validate_schema_accepts_the_shipped_example(capsys: Any) -> None:
-    code = main(["validate-schema", "--schema", str(EXAMPLE_SCHEMA_PATH)])
+    code = main(["validate-schema", "--schema", str(GENERIC_SCHEMA_PATH)])
 
     assert code == EXIT_OK
     assert "Schema OK" in capsys.readouterr().out
@@ -48,7 +48,7 @@ def test_validate_template_accepts_the_shipped_template(capsys: Any) -> None:
             "validate-template",
             str(EXAMPLE_TEMPLATE_PATH),
             "--schema",
-            str(EXAMPLE_SCHEMA_PATH),
+            str(GENERIC_SCHEMA_PATH),
         ]
     )
 
@@ -63,7 +63,7 @@ def test_validate_template_never_needs_scripted_results(
 ) -> None:
     path = make_workbook([case_row("TC-001")])
 
-    code = main(["validate-template", str(path), "--schema", str(EXAMPLE_SCHEMA_PATH)])
+    code = main(["validate-template", str(path), "--schema", str(GENERIC_SCHEMA_PATH)])
 
     assert code == EXIT_OK
     assert "Workbook OK" in capsys.readouterr().out
@@ -74,7 +74,7 @@ def test_validate_template_flags_invalid_rows(
 ) -> None:
     path = make_workbook([case_row("TC-BAD", source_type="postgres")])
 
-    code = main(["validate-template", str(path), "--schema", str(EXAMPLE_SCHEMA_PATH)])
+    code = main(["validate-template", str(path), "--schema", str(GENERIC_SCHEMA_PATH)])
 
     assert code == EXIT_FAILURES
     assert "unsupported value 'postgres'" in capsys.readouterr().out
@@ -82,7 +82,7 @@ def test_validate_template_flags_invalid_rows(
 
 def test_validate_template_reports_a_missing_workbook(tmp_path: Path, capsys: Any) -> None:
     code = main(
-        ["validate-template", str(tmp_path / "gone.xlsx"), "--schema", str(EXAMPLE_SCHEMA_PATH)]
+        ["validate-template", str(tmp_path / "gone.xlsx"), "--schema", str(GENERIC_SCHEMA_PATH)]
     )
 
     assert code == EXIT_USAGE
@@ -95,7 +95,7 @@ def test_execute_demonstration_run_exits_non_zero_on_failures(tmp_path: Path, ca
             "execute",
             str(EXAMPLE_TEMPLATE_PATH),
             "--schema",
-            str(EXAMPLE_SCHEMA_PATH),
+            str(GENERIC_SCHEMA_PATH),
             "--fake-results",
             str(EXAMPLE_FIXTURE_PATH),
             "--output-dir",
@@ -120,7 +120,7 @@ def test_execute_exits_zero_when_everything_passes(
             "execute",
             str(path),
             "--schema",
-            str(EXAMPLE_SCHEMA_PATH),
+            str(GENERIC_SCHEMA_PATH),
             "--fake-results",
             str(fake),
             "--output-dir",
@@ -138,7 +138,7 @@ def test_execute_case_selects_one_test(tmp_path: Path, capsys: Any) -> None:
             "execute",
             str(EXAMPLE_TEMPLATE_PATH),
             "--schema",
-            str(EXAMPLE_SCHEMA_PATH),
+            str(GENERIC_SCHEMA_PATH),
             "--case",
             "TC-PAY-008",
             "--fake-results",
@@ -160,7 +160,7 @@ def test_execute_case_is_repeatable(tmp_path: Path, capsys: Any) -> None:
             "execute",
             str(EXAMPLE_TEMPLATE_PATH),
             "--schema",
-            str(EXAMPLE_SCHEMA_PATH),
+            str(GENERIC_SCHEMA_PATH),
             "--case",
             "TC-PAY-001",
             "--case",
@@ -182,7 +182,7 @@ def test_execute_limit_runs_a_pilot(tmp_path: Path, capsys: Any) -> None:
             "execute",
             str(EXAMPLE_TEMPLATE_PATH),
             "--schema",
-            str(EXAMPLE_SCHEMA_PATH),
+            str(GENERIC_SCHEMA_PATH),
             "--limit",
             "2",
             "--fake-results",
@@ -203,7 +203,7 @@ def test_execute_fail_fast_stops_early(tmp_path: Path, capsys: Any) -> None:
             "execute",
             str(EXAMPLE_TEMPLATE_PATH),
             "--schema",
-            str(EXAMPLE_SCHEMA_PATH),
+            str(GENERIC_SCHEMA_PATH),
             "--fail-fast",
             "--fake-results",
             str(EXAMPLE_FIXTURE_PATH),
@@ -223,7 +223,7 @@ def test_execute_reports_an_unknown_case(tmp_path: Path, capsys: Any) -> None:
             "execute",
             str(EXAMPLE_TEMPLATE_PATH),
             "--schema",
-            str(EXAMPLE_SCHEMA_PATH),
+            str(GENERIC_SCHEMA_PATH),
             "--case",
             "TC-NOPE",
             "--fake-results",
@@ -239,7 +239,7 @@ def test_execute_reports_an_unknown_case(tmp_path: Path, capsys: Any) -> None:
 
 def test_execute_requires_scripted_results() -> None:
     with pytest.raises(SystemExit) as excinfo:
-        main(["execute", str(EXAMPLE_TEMPLATE_PATH), "--schema", str(EXAMPLE_SCHEMA_PATH)])
+        main(["execute", str(EXAMPLE_TEMPLATE_PATH), "--schema", str(GENERIC_SCHEMA_PATH)])
 
     assert excinfo.value.code == EXIT_USAGE
 
@@ -252,7 +252,7 @@ def test_execute_leaves_the_input_workbook_untouched(tmp_path: Path) -> None:
             "execute",
             str(EXAMPLE_TEMPLATE_PATH),
             "--schema",
-            str(EXAMPLE_SCHEMA_PATH),
+            str(GENERIC_SCHEMA_PATH),
             "--fake-results",
             str(EXAMPLE_FIXTURE_PATH),
             "--output-dir",
@@ -265,7 +265,7 @@ def test_execute_leaves_the_input_workbook_untouched(tmp_path: Path) -> None:
 
 def test_test_connections_is_an_explicit_offline_placeholder(capsys: Any) -> None:
     code = main(
-        ["test-connections", str(EXAMPLE_TEMPLATE_PATH), "--schema", str(EXAMPLE_SCHEMA_PATH)]
+        ["test-connections", str(EXAMPLE_TEMPLATE_PATH), "--schema", str(GENERIC_SCHEMA_PATH)]
     )
 
     err = capsys.readouterr().err
@@ -276,11 +276,11 @@ def test_test_connections_is_an_explicit_offline_placeholder(capsys: Any) -> Non
 def test_make_template_generates_a_matching_workbook(tmp_path: Path, capsys: Any) -> None:
     destination = tmp_path / "generated.xlsx"
 
-    code = main(["make-template", str(destination), "--schema", str(EXAMPLE_SCHEMA_PATH)])
+    code = main(["make-template", str(destination), "--schema", str(GENERIC_SCHEMA_PATH)])
 
     assert code == EXIT_OK
     assert destination.exists()
-    assert main(["validate-template", str(destination), "--schema", str(EXAMPLE_SCHEMA_PATH)]) == (
+    assert main(["validate-template", str(destination), "--schema", str(GENERIC_SCHEMA_PATH)]) == (
         EXIT_OK
     )
     capsys.readouterr()
@@ -290,7 +290,7 @@ def test_make_template_refuses_to_clobber_without_force(tmp_path: Path, capsys: 
     destination = tmp_path / "generated.xlsx"
     destination.write_bytes(b"existing")
 
-    code = main(["make-template", str(destination), "--schema", str(EXAMPLE_SCHEMA_PATH)])
+    code = main(["make-template", str(destination), "--schema", str(GENERIC_SCHEMA_PATH)])
 
     assert code == EXIT_USAGE
     assert "Use --force" in capsys.readouterr().err
@@ -334,7 +334,7 @@ def test_execute_survives_a_legacy_console_code_page(
             "execute",
             str(EXAMPLE_TEMPLATE_PATH),
             "--schema",
-            str(EXAMPLE_SCHEMA_PATH),
+            str(GENERIC_SCHEMA_PATH),
             "--fake-results",
             str(EXAMPLE_FIXTURE_PATH),
             "--output-dir",
@@ -355,7 +355,7 @@ def test_run_report_stays_ascii(tmp_path: Path, capsys: Any) -> None:
             "execute",
             str(EXAMPLE_TEMPLATE_PATH),
             "--schema",
-            str(EXAMPLE_SCHEMA_PATH),
+            str(GENERIC_SCHEMA_PATH),
             "--fake-results",
             str(EXAMPLE_FIXTURE_PATH),
             "--output-dir",

@@ -29,6 +29,7 @@ from .models import DatabaseType
 
 __all__ = [
     "FORBIDDEN_KEY_NAMES",
+    "ORACLE_CLIENT_MODES",
     "SUPPORTED_PROFILE_VERSIONS",
     "ConnectionProfile",
     "RunProfile",
@@ -41,9 +42,24 @@ SUPPORTED_PROFILE_VERSIONS: frozenset[str] = frozenset({"1.0"})
 _ALLOWED_TOP_LEVEL_KEYS = frozenset({"version", "workbook", "source", "target"})
 _ALLOWED_WORKBOOK_KEYS = frozenset({"path", "sheet"})
 _ALLOWED_SOURCE_KEYS = frozenset(
-    {"type", "server", "port", "database", "trust_server_certificate", "authentication", "username"}
+    {
+        "type",
+        "server",
+        "port",
+        "database",
+        "trust_server_certificate",
+        "authentication",
+        "username",
+        "oracle_client_mode",
+        "oracle_client_dir",
+    }
 )
 _ALLOWED_TARGET_KEYS = _ALLOWED_SOURCE_KEYS
+
+#: Oracle's two client modes. ``thin`` needs no install but reaches only Oracle
+#: Database 12.1 and later; ``thick`` loads the Oracle Client library and
+#: reaches back to 9.2.
+ORACLE_CLIENT_MODES: frozenset[str] = frozenset({"thin", "thick"})
 
 #: Keys that must never appear, anywhere in the document, at any depth. Naming
 #: them explicitly turns "I put the password in the file and it was ignored"
@@ -91,6 +107,10 @@ class ConnectionProfile:
     trust_server_certificate: bool | None = None
     auth_mode: AuthMode | None = None
     username: str | None = None
+    #: Oracle only. True selects thick mode, for servers older than 12.1.
+    use_thick_client: bool | None = None
+    #: Oracle thick mode only. Where the Oracle Client library lives.
+    oracle_client_dir: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +205,17 @@ def parse_profile(document: dict[str, Any], *, source: str = "<profile>") -> Run
             f"{source}: [target] Windows authentication is available for SQL Server only."
         )
 
+    # Re-checked after inheritance: a [target] with no "type" has no engine yet
+    # while _connection runs, so an Oracle-only key there escapes that pass.
+    for label, section in (("[source]", source_profile), ("[target]", target_profile)):
+        if (
+            section.use_thick_client is not None or section.oracle_client_dir is not None
+        ) and section.database_type is DatabaseType.SQLSERVER:
+            raise ReconciliationError(
+                f"{source}: {label} oracle_client_mode and oracle_client_dir apply to "
+                'type = "oracle" only.'
+            )
+
     return RunProfile(
         source=source_profile,
         target=target_profile,
@@ -230,6 +261,21 @@ def _connection(table: dict[str, Any], source: str, where: str) -> ConnectionPro
             f"{source}: {where} Windows authentication is available for SQL Server only."
         )
 
+    use_thick_client = _optional_client_mode(table, source, where)
+    oracle_client_dir = _optional_string(table, "oracle_client_dir", source, where)
+    if (use_thick_client is not None or oracle_client_dir is not None) and (
+        database_type is DatabaseType.SQLSERVER
+    ):
+        raise ReconciliationError(
+            f"{source}: {where} oracle_client_mode and oracle_client_dir apply to "
+            'type = "oracle" only.'
+        )
+    if oracle_client_dir is not None and use_thick_client is not True:
+        raise ReconciliationError(
+            f"{source}: {where} sets oracle_client_dir, which is only used in thick mode. "
+            'Add oracle_client_mode = "thick", or remove the directory.'
+        )
+
     return ConnectionProfile(
         database_type=database_type,
         server=_optional_string(table, "server", source, where),
@@ -238,7 +284,23 @@ def _connection(table: dict[str, Any], source: str, where: str) -> ConnectionPro
         trust_server_certificate=_optional_bool(table, "trust_server_certificate", source, where),
         auth_mode=auth_mode,
         username=username,
+        use_thick_client=use_thick_client,
+        oracle_client_dir=oracle_client_dir,
     )
+
+
+def _optional_client_mode(table: dict[str, Any], source: str, where: str) -> bool | None:
+    """``oracle_client_mode`` as a boolean: True for thick, False for thin."""
+    raw = _optional_string(table, "oracle_client_mode", source, where)
+    if raw is None:
+        return None
+    mode = raw.strip().casefold()
+    if mode not in ORACLE_CLIENT_MODES:
+        allowed = ", ".join(sorted(ORACLE_CLIENT_MODES))
+        raise ReconciliationError(
+            f"{source}: {where} oracle_client_mode must be one of: {allowed} (got {raw!r})"
+        )
+    return mode == "thick"
 
 
 def _normalize_key(key: str) -> str:

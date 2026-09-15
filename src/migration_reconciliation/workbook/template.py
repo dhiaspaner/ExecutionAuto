@@ -200,7 +200,7 @@ _README_LINES: tuple[tuple[str, ...], ...] = (
     ("It exists so the preserve_other_sheets guarantee is visible and testable.",),
     (),
     ("Column headers on the test-case sheet are bound to semantic fields by",),
-    ("config/workbook_schema.example.toml. Rename a header there, not in code.",),
+    ("the schema file passed with --schema. Rename a header there, not in code.",),
 )
 
 
