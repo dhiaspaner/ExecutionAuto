@@ -42,7 +42,7 @@ from .columns import (
     VALIDATION_SHEET,
 )
 
-__all__ = ["TIMESTAMP_FORMAT", "build_output_path", "write_results"]
+__all__ = ["TIMESTAMP_FORMAT", "ResultWriter", "build_output_path", "write_results"]
 
 #: Sortable, filename-safe, and identical on Windows and POSIX.
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
@@ -70,6 +70,137 @@ def build_output_path(
     filename = _UNSAFE_FILENAME_CHARS.sub("_", filename)
     directory = output_dir if output_dir is not None else input_path.parent
     return (directory / filename).resolve()
+
+
+class ResultWriter:
+    """Writes results one row at a time, saving after every one.
+
+    The output file is created the moment a run's shape is known — before its
+    first query runs — and is a complete, openable workbook from that instant:
+    every row not yet decided is exactly as the input left it. Each call to
+    :meth:`write_row` updates one row and saves again, so the file on disk is
+    never more than one test behind the run, and a run interrupted partway
+    through leaves every result decided up to that point rather than none at
+    all.
+
+    This costs one full workbook save per row instead of one for the whole
+    run. For a few hundred rows that is milliseconds each, not a run any
+    reconciliation size in mind here would notice; it buys a file that can be
+    opened in Excel *while the run is still going*.
+    """
+
+    def __init__(
+        self,
+        input_path: str | Path,
+        schema: WorkbookSchema,
+        *,
+        run_id: str,
+        timestamp: datetime,
+        output_dir: str | Path | None = None,
+    ) -> None:
+        source_path = Path(input_path).resolve()
+        if not source_path.is_file():
+            raise WorkbookError(f"Workbook not found: {source_path}")
+
+        directory = Path(output_dir).resolve() if output_dir is not None else None
+        output_path = build_output_path(
+            source_path, schema, timestamp=timestamp, run_id=run_id, output_dir=directory
+        )
+        if output_path == source_path:
+            raise WorkbookError(
+                "Refusing to write results over the input workbook. Check "
+                "output_filename_pattern in the schema."
+            )
+        if directory is not None and not directory.is_dir():
+            raise WorkbookError(f"Output directory does not exist: {directory}")
+        output_path = _resolve_free_path(output_path, run_id)
+
+        try:
+            workbook = load_workbook(source_path)
+        except Exception as exc:
+            raise WorkbookError(f"Cannot open workbook '{source_path.name}': {exc}") from None
+
+        if schema.sheet_name not in workbook.sheetnames:
+            available = ", ".join(workbook.sheetnames) or "<none>"
+            workbook.close()
+            raise WorkbookError(
+                f"Sheet '{schema.sheet_name}' not found. Available sheets: {available}"
+            )
+
+        self._schema = schema
+        self._workbook = workbook
+        self._sheet = workbook[schema.sheet_name]
+        self._column_map = _map_writable_columns(self._sheet, schema)
+        self._output_path = output_path
+        self._finished = False
+
+        # The file exists from here on, before anything has run: a crash on
+        # test one still leaves a real workbook behind, not nothing.
+        self._save()
+
+    @property
+    def output_path(self) -> Path:
+        return self._output_path
+
+    def write_row(self, result: ExecutionResult) -> None:
+        """Write one row's result and save immediately.
+
+        For a test that just ran: its outcome was unknown a moment ago, and
+        saving now is what keeps the file current while the run continues.
+        """
+        _write_row(self._sheet, self._schema, self._column_map, result)
+        self._save()
+
+    def write_rows(self, results: Iterable[ExecutionResult]) -> None:
+        """Write a whole group of results and save once.
+
+        For rows whose outcome was already decided together — disabled, out of
+        the requested range, beyond a limit. Saving after each of those would
+        rewrite the workbook hundreds of times to record something that was
+        never in doubt, which is the slow way to say nothing new.
+        """
+        wrote = False
+        for result in results:
+            _write_row(self._sheet, self._schema, self._column_map, result)
+            wrote = True
+        if wrote:
+            self._save()
+
+    def write_validation_report(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Replace the ``Syntax Validation`` sheet. Not saved until :meth:`finish`.
+
+        Unlike a row's own result, this sheet only means something once the
+        whole check is done, so there is nothing useful to show mid-run.
+        """
+        _write_sheet(self._workbook, VALIDATION_SHEET, VALIDATION_COLUMNS, rows)
+
+    def write_validation_errors(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Replace the ``Validation Errors`` sheet. Not saved until :meth:`finish`."""
+        _write_sheet(self._workbook, VALIDATION_ERRORS_SHEET, VALIDATION_ERRORS_COLUMNS, rows)
+
+    def finish(self) -> Path:
+        """Drop sheets the schema does not preserve, save once more, and close.
+
+        Safe to call more than once: a second call is a no-op that returns the
+        same path, so a caller cleaning up after an error never has to know
+        whether ``finish`` already ran.
+        """
+        if self._finished:
+            return self._output_path
+        if not self._schema.preserve_other_sheets:
+            for name in list(self._workbook.sheetnames):
+                if name != self._schema.sheet_name:
+                    del self._workbook[name]
+        self._save()
+        self._workbook.close()
+        self._finished = True
+        return self._output_path
+
+    def _save(self) -> None:
+        try:
+            self._workbook.save(self._output_path)
+        except OSError as exc:
+            raise WorkbookError(f"Cannot write '{self._output_path}': {exc.strerror}") from None
 
 
 def write_results(

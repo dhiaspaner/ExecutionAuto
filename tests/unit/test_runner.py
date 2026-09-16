@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -664,13 +665,15 @@ def test_an_execute_run_starts_executing_without_compiling_first(
     # An execute run does not compile first: it starts executing.
     assert "Validation phase" not in joined
     assert "Execution phase: running 2 test(s), one at a time." in joined
-    assert "TC-001  PASS" in joined
+    assert "TC-001" in joined
+    assert "-> PASS" in joined
 
 
-def test_the_progress_log_carries_no_sql_and_no_credential(
+def test_the_progress_log_shows_the_query_but_never_a_credential(
     make_workbook: Any, case_row: Any, schema: Any, make_results: Any
 ) -> None:
-    path = make_workbook([case_row("TC-001", source_sql="SELECT COUNT(*) FROM SECRET_TABLE")])
+    """Debugging needs the SQL on screen; it must never need the password too."""
+    path = make_workbook([case_row("TC-001", source_sql="SELECT COUNT(*) FROM SOME_TABLE")])
     book = make_results({"test_case_id": "TC-001", "source_result": 1, "target_result": 1})
     lines: list[str] = []
     ReconciliationRunner(schema, FakeExecutorFactory(book)).run(
@@ -678,8 +681,10 @@ def test_the_progress_log_carries_no_sql_and_no_credential(
     )
     joined = "\n".join(lines)
 
-    assert "SECRET_TABLE" not in joined
+    # The point of the debug line: the query actually sent is visible.
+    assert "SELECT COUNT(*) FROM SOME_TABLE" in joined
     assert "password" not in joined.casefold()
+    assert "pwd" not in joined.casefold()
 
 
 def test_the_validation_errors_sheet_names_every_rejected_query(
@@ -1051,3 +1056,463 @@ def test_a_mismatched_run_still_writes_its_evidence(
     # An execute run compiles nothing, so the correctly-paired row is absent
     # rather than claimed as checked.
     assert "TC-001" not in by_id
+
+
+# ---------------------------------------------------------------------------
+# --start-row / --end-row: run one slice of a large sheet.
+# ---------------------------------------------------------------------------
+
+
+def test_a_row_range_runs_only_that_slice(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """Rows are addressed the way Excel and every log line already number them."""
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 6)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 6)
+        ]
+    )
+
+    summary, factory = _run(schema, path, book, start_row=3, end_row=4)
+
+    results = _by_id(summary)
+    ran = {e.test_case_id for e in factory.created}
+    # The template puts the first case on row 2, so rows 3-4 are cases 2-3.
+    assert ran == {"TC-002", "TC-003"}
+    assert results["TC-001"].status is ExecutionStatus.SKIPPED
+    assert results["TC-001"].remarks == "Outside --start-row 3/--end-row 4"
+    assert results["TC-005"].status is ExecutionStatus.SKIPPED
+
+
+def test_a_start_row_alone_runs_to_the_end(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 6)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 6)
+        ]
+    )
+
+    summary, factory = _run(schema, path, book, start_row=5)
+
+    assert {e.test_case_id for e in factory.created} == {"TC-004", "TC-005"}
+    assert _by_id(summary)["TC-001"].remarks == "Outside --start-row 5/--end-row end"
+
+
+def test_an_end_row_alone_runs_from_the_first(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 6)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 6)
+        ]
+    )
+
+    summary, factory = _run(schema, path, book, end_row=3)
+
+    assert {e.test_case_id for e in factory.created} == {"TC-001", "TC-002"}
+    assert _by_id(summary)["TC-005"].remarks == "Outside --start-row 1/--end-row 3"
+
+
+def test_an_end_row_before_the_start_row_is_refused(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """Better to say so than to run nothing and call it a clean sheet."""
+    path = make_workbook([case_row("TC-001")])
+    book = make_results({"test_case_id": "TC-001", "source_result": 1, "target_result": 1})
+
+    with pytest.raises(WorkbookError, match="must be greater than or equal to"):
+        _run(schema, path, book, start_row=9, end_row=4)
+
+
+def test_a_start_row_below_one_is_refused(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row("TC-001")])
+    book = make_results({"test_case_id": "TC-001", "source_result": 1, "target_result": 1})
+
+    with pytest.raises(WorkbookError, match="--start-row must be 1 or greater"):
+        _run(schema, path, book, start_row=0)
+
+
+def test_a_row_range_narrows_an_explicit_case_selection(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """--case picks candidates; the range then narrows them, never widens."""
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 6)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 6)
+        ]
+    )
+
+    _, factory = _run(
+        schema, path, book, case_ids=("TC-001", "TC-002", "TC-005"), start_row=3, end_row=4
+    )
+
+    assert {e.test_case_id for e in factory.created} == {"TC-002"}
+
+
+# ---------------------------------------------------------------------------
+# The result workbook is written as the run goes, not at the end.
+# ---------------------------------------------------------------------------
+
+
+def _status_count(path: Any, schema: Any) -> int:
+    """How many rows on the sheet already carry a Status."""
+    from openpyxl import load_workbook
+
+    sheet = load_workbook(path)[schema.sheet_name]
+    header = {str(c.value).strip(): c.column for c in sheet[schema.header_row] if c.value}
+    column = header["Status"]
+    return sum(
+        1
+        for row in range(schema.first_data_row, sheet.max_row + 1)
+        if sheet.cell(row=row, column=column).value
+    )
+
+
+def test_the_result_file_exists_before_the_first_query_runs(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Any
+) -> None:
+    """A run killed on test one still leaves a real workbook, not nothing."""
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 4)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 4)
+        ]
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    seen: list[int] = []
+
+    def watch(message: str) -> None:
+        if message.startswith("      -> "):
+            produced = sorted(out.glob("*.xlsx"))
+            seen.append(_status_count(produced[0], schema) if produced else -1)
+
+    ReconciliationRunner(schema, FakeExecutorFactory(book)).run(
+        path, RunOptions(output_dir=out), on_progress=watch
+    )
+
+    # One more row carries a result after each test than before it.
+    assert seen == sorted(seen), "the file must only ever grow"
+    assert seen[0] >= 1, "the first test's result is on disk before the second runs"
+    assert seen[-1] > seen[0], "later tests keep landing in the same file"
+
+
+def test_rows_outside_the_range_are_written_before_anything_runs(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Any
+) -> None:
+    """Their outcome is already decided, so the file shows it from the start."""
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 6)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 6)
+        ]
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    first_seen: list[int] = []
+
+    def watch(message: str) -> None:
+        if message.startswith("Execution phase") and not first_seen:
+            produced = sorted(out.glob("*.xlsx"))
+            first_seen.append(_status_count(produced[0], schema) if produced else -1)
+
+    ReconciliationRunner(schema, FakeExecutorFactory(book)).run(
+        path, RunOptions(output_dir=out, start_row=3, end_row=4), on_progress=watch
+    )
+
+    # Five enabled rows, two of them in range: the other three are already
+    # decided and on disk before the first query runs.
+    assert first_seen == [3]
+
+
+def test_the_finished_file_matches_a_whole_run(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Any
+) -> None:
+    """Writing row by row must leave exactly what one final write would have."""
+    from openpyxl import load_workbook
+
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 4)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 4)
+        ]
+    )
+
+    summary, _ = _run(schema, path, book, write_output=True, output_dir=tmp_path)
+
+    assert summary.output_path is not None
+    sheet = load_workbook(summary.output_path)[schema.sheet_name]
+    header = {str(c.value).strip(): c.column for c in sheet[schema.header_row] if c.value}
+    statuses = [
+        sheet.cell(row=row, column=header["Status"]).value
+        for row in range(schema.first_data_row, schema.first_data_row + 3)
+    ]
+    assert statuses == ["PASS", "PASS", "PASS"]
+    # The input workbook is still untouched, as it always was.
+    assert _status_count(path, schema) == 0
+
+
+def test_no_write_leaves_no_file_at_all(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Any
+) -> None:
+    path = make_workbook([case_row("TC-001")])
+    book = make_results({"test_case_id": "TC-001", "source_result": 1, "target_result": 1})
+    out = tmp_path / "out"
+    out.mkdir()
+
+    summary = ReconciliationRunner(schema, FakeExecutorFactory(book)).run(
+        path, RunOptions(output_dir=out, write_output=False)
+    )
+
+    assert summary.output_path is None
+    assert list(out.glob("*.xlsx")) == []
+
+
+# ---------------------------------------------------------------------------
+# Every test case reaches the log, exactly once, however it turned out.
+# ---------------------------------------------------------------------------
+
+
+def _log_of_run(schema: Any, path: Any, book: Any, **option_overrides: Any) -> tuple[str, Any]:
+    lines: list[str] = []
+    summary = ReconciliationRunner(schema, FakeExecutorFactory(book)).run(
+        path, RunOptions(write_output=False, **option_overrides), on_progress=lines.append
+    )
+    return "\n".join(lines), summary
+
+
+def test_every_test_case_appears_in_the_log(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """A row missing from the log cannot be told from one nobody selected."""
+    path = make_workbook(
+        [case_row("TC-001"), case_row("TC-002"), case_row("TC-OFF", enabled=False)]
+    )
+    book = make_results(
+        *[{"test_case_id": t, "source_result": 1, "target_result": 1} for t in ("TC-001", "TC-002")]
+    )
+
+    joined, summary = _log_of_run(schema, path, book, start_row=2, end_row=2)
+
+    for result in summary.results:
+        assert result.test_case_id in joined, f"{result.test_case_id} never reached the log"
+
+
+def test_rows_stopped_by_fail_fast_are_logged_not_dropped(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 5)])
+    book = make_results(
+        {"test_case_id": "TC-001", "source_result": 1, "target_result": 9},
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(2, 5)
+        ],
+    )
+
+    joined, summary = _log_of_run(schema, path, book, fail_fast=True)
+
+    assert "Stopped by --fail-fast" in joined
+    for result in summary.results:
+        assert result.test_case_id in joined
+    # The ones that never ran say so rather than vanishing.
+    halted = [line for line in joined.splitlines() if "TC-004" in line]
+    assert halted and all("SKIPPED" in line for line in halted)
+
+
+def test_a_case_is_never_logged_or_recorded_twice(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """A dialect mismatch is found offline and must not be counted again."""
+    path = make_workbook(
+        [
+            case_row("TC-001"),
+            # The fixture's source is Oracle, so T-SQL is the mismatch here.
+            case_row("TC-BAD", source_sql="SELECT COUNT_BIG(*) FROM dbo.T"),
+        ]
+    )
+    book = make_results(
+        *[{"test_case_id": t, "source_result": 1, "target_result": 1} for t in ("TC-001", "TC-BAD")]
+    )
+
+    joined, summary = _log_of_run(schema, path, book, mode=RunMode.VALIDATE)
+
+    seen = Counter(r.test_case_id for r in summary.results)
+    assert seen["TC-BAD"] == 1, "the mismatch was recorded twice"
+    assert seen["TC-001"] == 1
+    # One result line for it in the log, not two.
+    rows = [line for line in joined.splitlines() if line.startswith("  row") and "TC-BAD" in line]
+    assert len(rows) == 1, rows
+
+
+def test_the_dialect_report_names_every_row_it_rejected(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """More than five mismatches must still all be named, not summarised away."""
+    rows = [
+        case_row(f"TC-{i:03d}", source_sql="SELECT COUNT_BIG(*) FROM dbo.T") for i in range(1, 8)
+    ]
+    path = make_workbook(rows)
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 8)
+        ]
+    )
+
+    joined, _ = _log_of_run(schema, path, book)
+
+    for i in range(1, 8):
+        assert f"TC-{i:03d}" in joined
+    assert "and 2 more" not in joined
+
+
+# ---------------------------------------------------------------------------
+# Rows decided as a group are written as a group, not one save each.
+# ---------------------------------------------------------------------------
+
+
+def _count_saves(monkeypatch: Any) -> dict[str, int]:
+    """Count how many times the result workbook is written to disk."""
+    from migration_reconciliation.workbook import writer as writer_module
+
+    saves = {"n": 0}
+    original = writer_module.ResultWriter._save
+
+    def counting(self: Any) -> None:
+        saves["n"] += 1
+        original(self)
+
+    monkeypatch.setattr(writer_module.ResultWriter, "_save", counting)
+    return saves
+
+
+def test_rows_outside_the_range_cost_one_save_not_one_each(
+    make_workbook: Any,
+    case_row: Any,
+    schema: Any,
+    make_results: Any,
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    """Their outcome was never in doubt; rewriting the file per row says nothing."""
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 11)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 11)
+        ]
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    saves = _count_saves(monkeypatch)
+
+    ReconciliationRunner(schema, FakeExecutorFactory(book)).run(
+        path, RunOptions(output_dir=out, start_row=3, end_row=4)
+    )
+
+    # One to create the file, one for the eight skipped rows together, one per
+    # executed test, one to finish. Not one per row.
+    assert saves["n"] == 5
+
+
+def test_each_executed_test_still_gets_its_own_save(
+    make_workbook: Any,
+    case_row: Any,
+    schema: Any,
+    make_results: Any,
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    """The live file is the point: an executed row must land as it happens."""
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 5)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 5)
+        ]
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    saves = _count_saves(monkeypatch)
+
+    ReconciliationRunner(schema, FakeExecutorFactory(book)).run(path, RunOptions(output_dir=out))
+
+    # Create, four executed tests, finish. Nothing was batched away.
+    assert saves["n"] == 6
+
+
+def test_fail_fast_writes_the_abandoned_rows_in_one_go(
+    make_workbook: Any,
+    case_row: Any,
+    schema: Any,
+    make_results: Any,
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 8)])
+    book = make_results(
+        {"test_case_id": "TC-001", "source_result": 1, "target_result": 9},
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(2, 8)
+        ],
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    saves = _count_saves(monkeypatch)
+
+    summary = ReconciliationRunner(schema, FakeExecutorFactory(book)).run(
+        path, RunOptions(output_dir=out, fail_fast=True)
+    )
+
+    # Create, the one test that ran, the six abandoned rows together, finish.
+    assert saves["n"] == 4
+    skipped = [r for r in summary.results if r.status is ExecutionStatus.SKIPPED]
+    assert len(skipped) == 6
+    assert all(r.remarks == "Stopped by --fail-fast" for r in skipped)
+
+
+def test_batching_writes_exactly_the_same_rows(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Any
+) -> None:
+    """Fewer saves must not mean fewer results on the sheet."""
+    from openpyxl import load_workbook
+
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 7)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 7)
+        ]
+    )
+
+    summary, _ = _run(
+        schema, path, book, start_row=3, end_row=4, write_output=True, output_dir=tmp_path
+    )
+
+    assert summary.output_path is not None
+    sheet = load_workbook(summary.output_path)[schema.sheet_name]
+    header = {str(c.value).strip(): c.column for c in sheet[schema.header_row] if c.value}
+    written = [
+        sheet.cell(row=row, column=header["Status"]).value
+        for row in range(schema.first_data_row, schema.first_data_row + 6)
+    ]
+    # Every row carries a status: the skipped ones too, batched or not.
+    assert all(written), written
+    assert written[1] == "PASS" and written[2] == "PASS"
+    assert written[0] == "SKIPPED" and written[5] == "SKIPPED"

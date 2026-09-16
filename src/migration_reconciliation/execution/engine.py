@@ -97,18 +97,14 @@ _PLATFORM_OF_SIDE: Mapping[str, Platform] = {
 ProgressLog = Callable[[str], None]
 
 
-#: How much of a sanitized error to show on one progress line. The whole of it
-#: is written to the ``Validation Errors`` sheet, so the console stays scannable
-#: at two hundred rows instead of scrolling one failure off the top.
-_PROGRESS_DETAIL_CHARS = 110
-
-
 def _short(detail: str) -> str:
-    """One line's worth of an already-sanitized message."""
-    collapsed = " ".join(detail.split())
-    if len(collapsed) <= _PROGRESS_DETAIL_CHARS:
-        return collapsed
-    return f"{collapsed[:_PROGRESS_DETAIL_CHARS].rstrip()}..."
+    """One line's worth of an already-sanitized message.
+
+    Collapsed onto one line so a multi-line driver error cannot break the
+    ``[index/total] id  status`` layout, but never cut short: a truncated
+    "..." is exactly the failure someone is trying to read past.
+    """
+    return " ".join(detail.split())
 
 
 def _progress(log: ProgressLog | None) -> ProgressLog:

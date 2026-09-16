@@ -13,7 +13,7 @@ on — unless ``--fail-fast`` was requested.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -43,11 +43,12 @@ from .models import (
     TestCase,
     WorkbookSchema,
 )
+from .reporting import render_identity
 from .security.redaction import sanitize_error, sanitize_text
 from .security.sql_guard import assert_read_only
 from .workbook.columns import VALIDATION_ERRORS_SHEET
 from .workbook.reader import InvalidRow, SkippedRow, read_workbook
-from .workbook.writer import write_results
+from .workbook.writer import ResultWriter
 
 __all__ = ["ReconciliationRunner", "RunOptions", "new_run_id"]
 
@@ -61,13 +62,9 @@ _CODE_UNEXPECTED = "UNEXPECTED_ERROR"
 _CODE_SYNTAX = SQL_SYNTAX_ERROR_CODE
 _CODE_DIALECT = "SQL_DIALECT_MISMATCH"
 
-#: How many mismatched tests the platform message names before "and N more".
-_NAMED_IN_MISMATCH_MESSAGE = 5
-
-#: How much of a sanitized message one progress line carries. The whole of it
-#: reaches the ``Validation Errors`` sheet, so the console stays readable when
-#: two hundred rows share one broken view.
-_PROGRESS_DETAIL_CHARS = 110
+#: Stands in for "no upper bound" on --end-row, so the range check is one
+#: comparison regardless of whether the person gave an end at all.
+_NO_END_ROW = 2**63
 
 #: The validation sheets describe compiling, not reconciling, so they keep
 #: their own vocabulary: a rejected query reads SYNTAX ERROR there even though
@@ -83,10 +80,24 @@ ProgressLog = Callable[[str], None]
 
 
 def _short(detail: str) -> str:
-    collapsed = " ".join(detail.split())
-    if len(collapsed) <= _PROGRESS_DETAIL_CHARS:
-        return collapsed
-    return f"{collapsed[:_PROGRESS_DETAIL_CHARS].rstrip()}..."
+    """One line's worth of an already-sanitized message.
+
+    Collapsed onto one line so a multi-line driver error cannot break the
+    ``[index/total] id  status`` layout, but never cut short: a truncated
+    "..." is exactly the failure someone is trying to read past.
+    """
+    return " ".join(detail.split())
+
+
+def _result_line(result: ExecutionResult) -> str:
+    """One log line for one test case, whatever became of it.
+
+    Every row the run touched says so, so the log accounts for the whole
+    sheet rather than only the rows that reached a database.
+    """
+    code = f"[{result.error_code}] " if result.error_code else ""
+    detail = f"  {code}{_short(result.remarks)}" if (code or result.remarks) else ""
+    return f"  row {result.row_number:>4}  {result.test_case_id:<14} {result.status.value}{detail}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +180,12 @@ class RunOptions:
     #: What to do about a query the database will not compile. The default
     #: records it as ``ERROR`` and runs the rest.
     on_syntax_error: OnSyntaxError = OnSyntaxError.CONTINUE
+    #: Restrict the run to workbook rows in this inclusive range (as Excel
+    #: numbers them, matching ``row_number`` and every log line and sheet that
+    #: already reports it). ``None`` on either end leaves that side open.
+    #: Applied after ``--case``, so the two can be combined.
+    start_row: int | None = None
+    end_row: int | None = None
     output_dir: Path | None = None
     write_output: bool = True
     run_id: str = field(default_factory=new_run_id)
@@ -254,13 +271,10 @@ class ReconciliationRunner:
             log("")
             log(
                 f"  {len(mismatches)} of {len(cases)} test(s) name a connection that speaks "
-                f"a different dialect, and are recorded as ERROR."
+                f"a different dialect, and are recorded as ERROR:"
             )
-            for result in mismatches[:_NAMED_IN_MISMATCH_MESSAGE]:
-                log(f"    row {result.row_number}  {result.test_case_id}  {_short(result.remarks)}")
-            unnamed = len(mismatches) - _NAMED_IN_MISMATCH_MESSAGE
-            if unnamed > 0:
-                log(f"    ... and {unnamed} more")
+            # The rows themselves are logged as they are recorded, every one of
+            # them: a list cut off at five hides the row someone is looking for.
         return tuple(mismatches)
 
     def validate_cases(
@@ -454,13 +468,71 @@ class ReconciliationRunner:
         read = read_workbook(path, self._schema)
         selected, deselected = _select(read.test_cases, opts)
 
-        results: list[ExecutionResult] = [
+        results: list[ExecutionResult] = []
+        writer: ResultWriter | None = None
+        if opts.write_output:
+            # Created now, before a single query runs: the output file exists
+            # and is openable from this point on, and every write below saves
+            # it again, so it is never more than one test behind the run.
+            writer = ResultWriter(
+                path,
+                self._schema,
+                run_id=opts.run_id,
+                timestamp=started_at,
+                output_dir=opts.output_dir,
+            )
+            log(f"  Result workbook: {writer.output_path}")
+
+        def record(result: ExecutionResult, *, announce: bool = True) -> None:
+            """Record one result: to the summary, to the file, and to the log.
+
+            ``announce`` is off only where the caller has already printed a
+            richer block for that row, so every test case reaches the log
+            exactly once however it turned out.
+            """
+            results.append(result)
+            if writer is not None:
+                writer.write_row(result)
+            if announce:
+                log(_result_line(result))
+
+        def record_all(rs: Iterable[ExecutionResult], *, announce: bool = True) -> None:
+            """Record a group whose outcomes were all decided together.
+
+            Each still reaches the log on its own line, but the workbook is
+            saved once for the whole group rather than once per row: these
+            outcomes were settled before the group was formed, so there is no
+            intermediate state worth writing.
+            """
+            group = list(rs)
+            if not group:
+                return
+            results.extend(group)
+            if writer is not None:
+                writer.write_rows(group)
+            if announce:
+                for result in group:
+                    log(_result_line(result))
+
+        undecided = [
             self._workbook_error_result(invalid, opts.run_id, started_at)
             for invalid in read.invalid
         ]
-        results.extend(
+        undecided.extend(
             self._skipped_result(skipped, opts.run_id, started_at) for skipped in read.skipped
         )
+        # Rows outside --case/--start-row/--end-row/--limit are already fully
+        # decided, so they are written now rather than held until the end.
+        undecided.extend(
+            self._skipped_result(
+                SkippedRow(case.row_number, case.test_case_id, reason), opts.run_id, started_at
+            )
+            for case, reason in deselected
+        )
+        if undecided:
+            log("")
+            log(f"Not run ({len(undecided)} test(s)), decided before anything was opened:")
+        record_all(sorted(undecided, key=lambda r: r.row_number))
 
         validation = ValidationOutcome(passed=tuple(selected))
         try:
@@ -469,7 +541,7 @@ class ReconciliationRunner:
             # nothing to find.
             mismatches = self.check_dialects(selected, opts.run_id, log=log)
             mismatched_ids = {result.test_case_id for result in mismatches}
-            results.extend(mismatches)
+            record_all(mismatches)
             # A row bound for the wrong engine is not sent to any database, but
             # it no longer stops the rows that are correctly paired.
             mismatch_rows = tuple(
@@ -501,21 +573,24 @@ class ReconciliationRunner:
                     failures=mismatches,
                     rows=mismatch_rows,
                 )
-                results.extend(mismatches)
                 log("")
                 log(f"Execution phase: running {len(selected)} test(s), one at a time.")
-                self._execute_all(selected, opts, results, log)
-                return self._finish(path, opts, started_at, results, deselected, validation)
+                self._execute_all(selected, opts, record, record_all, log)
+                return self._finish(path, opts, started_at, results, writer, validation)
 
             validation = self.validate_cases(selected, opts.run_id, log=log)
             # Mismatched rows belong on the evidence sheets too, even though
             # they never reached the database.
+            # Only the rejections this pass found are recorded here: the
+            # mismatches are merged in for the evidence sheets, but they were
+            # already recorded above and must not be counted a second time.
+            # The compile loop announced each of these as it checked it.
+            record_all(validation.failures, announce=False)
             validation = replace(
                 validation,
                 failures=(*mismatches, *validation.failures),
                 rows=(*mismatch_rows, *validation.rows),
             )
-            results.extend(validation.failures)
             if validation.gate_closed:
                 log("")
                 log(
@@ -541,7 +616,7 @@ class ReconciliationRunner:
                     f"{len(validation.passed)} test(s) that did compile were left unrun."
                 )
                 checked_at = datetime.now(UTC).replace(microsecond=0)
-                results.extend(
+                record_all(
                     self._not_executed(case, opts.run_id, checked_at) for case in validation.passed
                 )
             elif opts.mode is RunMode.VALIDATE:
@@ -551,45 +626,64 @@ class ReconciliationRunner:
                     f"{len(validation.passed)} test(s) compiled and none were executed."
                 )
                 checked_at = datetime.now(UTC).replace(microsecond=0)
-                results.extend(
+                record_all(
                     self._validated(case, opts.run_id, checked_at) for case in validation.passed
                 )
             else:
                 log("")
                 log(f"Execution phase: running {len(validation.passed)} test(s), one at a time.")
-                self._execute_all(validation.passed, opts, results, log)
+                self._execute_all(validation.passed, opts, record, record_all, log)
         finally:
             self._factory.close_all()
 
-        return self._finish(path, opts, started_at, results, deselected, validation)
+        return self._finish(path, opts, started_at, results, writer, validation)
 
     def _execute_all(
         self,
         cases: Sequence[TestCase],
         opts: RunOptions,
-        results: list[ExecutionResult],
+        record: Callable[..., None],
+        record_all: Callable[..., None],
         log: ProgressLog,
     ) -> None:
-        """Run each test in row order, reporting as it goes.
+        """Run each test in row order, reporting and recording as it goes.
 
         Shared by both routes into execution, so a run that skipped the
-        compile pass behaves identically once it starts executing.
+        compile pass behaves identically once it starts executing. ``record``
+        is what makes each result reach the result workbook immediately —
+        this method knows nothing about files, only about running tests.
+
+        Every case in ``cases`` produces log output, including the ones a
+        ``--fail-fast`` stop means never ran: a test that vanishes from the
+        log is indistinguishable from one nobody selected. Those are handed
+        over as one group, because one answer settled all of them at once.
         """
-        stopped_reason = ""
         total = len(cases)
         for index, case in enumerate(cases, start=1):
-            if stopped_reason:
-                halted = SkippedRow(case.row_number, case.test_case_id, stopped_reason)
-                results.append(self._skipped_result(halted, opts.run_id, datetime.now(UTC)))
-                continue
-            result = self.execute_case(case, opts.run_id)
-            results.append(result)
+            log(f"  [{index:>4}/{total}] {case.test_case_id}")
+            result = self.execute_case(case, opts.run_id, log=log)
+            # Already announced in full above, down to the query and the value.
+            record(result, announce=False)
             detail = (
                 f"  [{result.error_code}] {_short(result.remarks)}" if result.error_code else ""
             )
-            log(f"  [{index:>4}/{total}] {case.test_case_id}  {result.status.value}{detail}")
+            log(f"      -> {result.status.value}{detail}")
             if opts.fail_fast and result.status is not ExecutionStatus.PASS:
-                stopped_reason = "Stopped by --fail-fast"
+                reason = "Stopped by --fail-fast"
+                remaining = cases[index:]
+                if remaining:
+                    log("")
+                    log(f"  {reason}. {len(remaining)} test(s) are not run:")
+                    halted_at = datetime.now(UTC)
+                    record_all(
+                        self._skipped_result(
+                            SkippedRow(later.row_number, later.test_case_id, reason),
+                            opts.run_id,
+                            halted_at,
+                        )
+                        for later in remaining
+                    )
+                return
 
     def _finish(
         self,
@@ -597,34 +691,22 @@ class ReconciliationRunner:
         opts: RunOptions,
         started_at: datetime,
         results: list[ExecutionResult],
-        deselected: Sequence[tuple[TestCase, str]],
+        writer: ResultWriter | None,
         validation: ValidationOutcome,
     ) -> RunSummary:
-        """Record the deselected rows, write the workbook and summarise.
+        """Close out the result workbook and summarise the run.
 
-        Shared by every way a run can end, so a run stopped early still leaves
-        the same evidence as one that finished.
+        Every row was already written as it was decided; what is left is the
+        two validation sheets, which only mean something once the whole run
+        is known, and the final save.
         """
-        results.extend(
-            self._skipped_result(
-                SkippedRow(case.row_number, case.test_case_id, reason), opts.run_id, started_at
-            )
-            for case, reason in deselected
-        )
         results.sort(key=lambda r: r.row_number)
 
         output_path: Path | None = None
-        if opts.write_output:
-            output_path = write_results(
-                path,
-                self._schema,
-                results,
-                run_id=opts.run_id,
-                timestamp=started_at,
-                output_dir=opts.output_dir,
-                validation_errors=validation.error_rows(),
-                validation_rows=validation.report_rows(),
-            )
+        if writer is not None:
+            writer.write_validation_report(validation.report_rows())
+            writer.write_validation_errors(validation.error_rows())
+            output_path = writer.finish()
 
         return RunSummary(
             run_id=opts.run_id,
@@ -635,8 +717,17 @@ class ReconciliationRunner:
             results=results,
         )
 
-    def execute_case(self, case: TestCase, run_id: str) -> ExecutionResult:
-        """Execute and compare one test case. Never raises for case-level failures."""
+    def execute_case(
+        self, case: TestCase, run_id: str, *, log: ProgressLog | None = None
+    ) -> ExecutionResult:
+        """Execute and compare one test case. Never raises for case-level failures.
+
+        ``log`` receives one line per side naming the connection actually used
+        — engine, host, database — and the query sent to it, then the value
+        and how long it took. All of it comes from :class:`ConnectionIdentity`
+        and the workbook's own SQL, so nothing secret is ever formatted in.
+        """
+        emit: ProgressLog = log if log is not None else (lambda _m: None)
         started = perf_counter()
         executed_at = datetime.now(UTC).replace(microsecond=0)
         source_value: ScalarValue = None
@@ -698,7 +789,10 @@ class ReconciliationRunner:
         if scope.uses_source:
             try:
                 source_executor = self._executor_for(case, QuerySide.SOURCE)
+                self._log_before_query(emit, "SOURCE", source_executor, case.source_sql)
+                query_started = perf_counter()
                 source_value = source_executor.execute_scalar(case.source_sql, case.timeout_seconds)
+                emit(f"      SOURCE  -> {source_value!r}  ({_elapsed_ms(query_started)} ms)")
             except Exception as exc:
                 return finish(
                     ExecutionStatus.ERROR,
@@ -711,7 +805,10 @@ class ReconciliationRunner:
         if scope.uses_target:
             try:
                 target_executor = self._executor_for(case, QuerySide.TARGET)
+                self._log_before_query(emit, "TARGET", target_executor, case.target_sql)
+                query_started = perf_counter()
                 target_value = target_executor.execute_scalar(case.target_sql, case.timeout_seconds)
+                emit(f"      TARGET  -> {target_value!r}  ({_elapsed_ms(query_started)} ms)")
             except Exception as exc:
                 return finish(
                     ExecutionStatus.ERROR,
@@ -738,6 +835,24 @@ class ReconciliationRunner:
         else:
             status = ExecutionStatus.PASS if outcome.passed else ExecutionStatus.FAIL
         return finish(status, outcome.remarks, variance=outcome.variance)
+
+    def _log_before_query(
+        self, log: ProgressLog, label: str, executor: QueryExecutor, sql: str
+    ) -> None:
+        """Name the connection a query is about to run on, and the query itself.
+
+        ``test_connection()`` does no network round trip once a session is
+        open — it reports what the driver already knows, so asking for it here
+        costs nothing per query. If it fails for any reason, execution carries
+        on without the debug line rather than losing the real result over it.
+        """
+        try:
+            identity = executor.test_connection()
+        except Exception:
+            log(f"      {label}  (connection details unavailable)")
+        else:
+            log(f"      {label}  {render_identity(identity)}")
+        log(f"              {' '.join(sql.split())}")
 
     def _executor_for(self, case: TestCase, side: QuerySide) -> QueryExecutor:
         if side is QuerySide.SOURCE:
@@ -811,6 +926,20 @@ def _select(
             if c.test_case_id.casefold() not in wanted
         )
         selected = matched
+
+    if options.start_row is not None or options.end_row is not None:
+        start = options.start_row if options.start_row is not None else 1
+        end = options.end_row if options.end_row is not None else _NO_END_ROW
+        if start < 1:
+            raise WorkbookError(f"--start-row must be 1 or greater (got {start})")
+        if options.end_row is not None and end < start:
+            raise WorkbookError(
+                f"--end-row ({end}) must be greater than or equal to --start-row ({start})"
+            )
+        shown_end = "end" if options.end_row is None else str(end)
+        label = f"Outside --start-row {start}/--end-row {shown_end}"
+        deselected.extend((c, label) for c in selected if not (start <= c.row_number <= end))
+        selected = [c for c in selected if start <= c.row_number <= end]
 
     if options.limit is not None:
         if options.limit < 0:

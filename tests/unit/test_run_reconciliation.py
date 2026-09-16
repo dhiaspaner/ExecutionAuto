@@ -274,6 +274,8 @@ def test_no_password_flag_exists() -> None:
         "--mode",
         "--on-syntax-error",
         "--case",
+        "--start-row",
+        "--end-row",
         "--limit",
         "--output-dir",
     }

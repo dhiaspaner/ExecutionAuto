@@ -126,6 +126,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run only this test case id. Repeatable.",
     )
     parser.add_argument(
+        "--start-row",
+        type=int,
+        metavar="N",
+        help=(
+            "Skip enabled rows before workbook row N (Excel's own row numbers, the "
+            "same ones every log line and result row reports). Combines with --end-row "
+            "to run one slice of a large sheet; applied after --case."
+        ),
+    )
+    parser.add_argument(
+        "--end-row",
+        type=int,
+        metavar="N",
+        help="Skip enabled rows after workbook row N (inclusive). See --start-row.",
+    )
+    parser.add_argument(
         "--limit", type=int, metavar="N", help="Run at most N test cases (pilot run)."
     )
     parser.add_argument(
@@ -190,6 +206,8 @@ def _run(args: argparse.Namespace) -> int:
 
         options = RunOptions(
             case_ids=tuple(args.cases),
+            start_row=args.start_row,
+            end_row=args.end_row,
             limit=args.limit,
             output_dir=args.output_dir,
             write_output=True,
