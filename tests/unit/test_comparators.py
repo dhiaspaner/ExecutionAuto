@@ -131,7 +131,12 @@ def test_numeric_tolerance_rejects_text() -> None:
         compare(TOLERANCE, "abc", 1, Decimal(1))
 
 
-@pytest.mark.parametrize("rule", list(ComparisonRule))
+#: Every rule that renders a verdict. ``no_comparison`` renders none, so it
+#: has nothing to refuse and is covered separately below.
+_VERDICT_RULES = [rule for rule in ComparisonRule if rule is not ComparisonRule.NO_COMPARISON]
+
+
+@pytest.mark.parametrize("rule", _VERDICT_RULES)
 @pytest.mark.parametrize(
     ("source", "target"),
     [(None, 1), (1, None), (None, None), ("", 1), (1, "   ")],
@@ -141,6 +146,20 @@ def test_null_never_reconciles_under_any_rule(
 ) -> None:
     with pytest.raises(ComparisonError, match="NULL"):
         compare(rule, source, target, Decimal(0))
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [(None, 1), (1, None), (None, None), ("", 1), (1, "   ")],
+)
+def test_no_comparison_records_a_null_instead_of_reconciling_it(
+    source: ScalarValue, target: ScalarValue
+) -> None:
+    """A profiling row tolerates a NULL, but must never report it as a pass."""
+    outcome = compare(ComparisonRule.NO_COMPARISON, source, target, Decimal(0))
+    assert outcome.profiled is True
+    assert outcome.passed is False
+    assert outcome.variance is None
 
 
 @pytest.mark.parametrize(

@@ -52,10 +52,11 @@ DEFAULT_PORTS: dict[DatabaseType, int] = {
 #: is the default and a profile opts out with oracle_client_mode = "thin".
 DEFAULT_ORACLE_THICK_MODE = True
 
-#: Seconds to wait for a connection before giving up. Long enough for a slow
-#: VPN handshake, short enough that an unreachable host fails while the person
-#: is still watching the terminal.
-CONNECT_TIMEOUT_SECONDS = 15
+#: Seconds to wait for a connection before giving up. ``0`` means wait
+#: indefinitely, which is what both drivers read a zero as: an unreachable
+#: host will not fail on its own, so a run against a wrong server waits rather
+#: than reporting it.
+CONNECT_TIMEOUT_SECONDS = 0
 
 
 def default_port_for(database_type: DatabaseType) -> int:

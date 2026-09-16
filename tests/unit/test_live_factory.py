@@ -153,3 +153,56 @@ def test_one_failing_close_never_skips_the_other() -> None:
     factory.close_all()
 
     assert target_connection.closed is True
+
+
+def test_a_declared_engine_that_contradicts_the_profile_stops_the_run() -> None:
+    """A workbook saying "this side is Oracle" must not get a SQL Server session.
+
+    Silently handing back the configured connection would compile Oracle SQL
+    on SQL Server: a query valid in both dialects would pass a check that
+    proved nothing about the database it will really run against.
+    """
+    factory = LiveExecutorFactory(
+        settings(QuerySide.SOURCE, DatabaseType.SQLSERVER),
+        settings(QuerySide.TARGET, DatabaseType.SQLSERVER),
+        source_driver=FakePyodbc(),
+        target_driver=FakePyodbc(),
+    )
+
+    with pytest.raises(ReconciliationError) as raised:
+        factory.get_executor(
+            connection_name="source",
+            database_type=DatabaseType.ORACLE,
+            test_case_id="TC-WPS-001",
+            side=QuerySide.SOURCE,
+        )
+
+    message = str(raised.value)
+    assert "TC-WPS-001" in message
+    assert "oracle" in message
+    assert "sqlserver" in message
+    # Nothing secret leaks into a configuration complaint.
+    assert "password" not in message.casefold()
+
+
+def test_a_matching_engine_is_handed_out_as_before() -> None:
+    factory = LiveExecutorFactory(
+        settings(QuerySide.SOURCE, DatabaseType.SQLSERVER),
+        settings(QuerySide.TARGET, DatabaseType.SQLSERVER),
+        source_driver=FakePyodbc(),
+        target_driver=FakePyodbc(),
+    )
+
+    executor = factory.get_executor(
+        connection_name="source",
+        database_type=DatabaseType.SQLSERVER,
+        test_case_id="TC-001",
+        side=QuerySide.SOURCE,
+    )
+
+    assert executor is factory.get_executor(
+        connection_name="source",
+        database_type=DatabaseType.SQLSERVER,
+        test_case_id="TC-002",
+        side=QuerySide.SOURCE,
+    ), "every case still shares one connection per side"

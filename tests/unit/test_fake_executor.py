@@ -104,9 +104,10 @@ def test_single_scalar_helper_enforces_the_shape() -> None:
         single_scalar([[1, 2]])
 
 
-def test_rejects_a_non_positive_timeout() -> None:
-    with pytest.raises(DatabaseExecutionError, match="Timeout must be greater than 0"):
-        _executor(FakeResponse(value=1)).execute_scalar("SELECT 1", 0)
+def test_a_non_positive_timeout_means_no_limit() -> None:
+    """The fake mirrors the real adapters: zero is "no limit", not an error."""
+    assert _executor(FakeResponse(value=1)).execute_scalar("SELECT 1", 0) == 1
+    assert _executor(FakeResponse(value=1)).execute_scalar("SELECT 1", -5) == 1
 
 
 def test_test_connection_describes_without_secrets() -> None:
@@ -261,9 +262,8 @@ def test_a_scripted_syntax_error_is_raised_before_execution() -> None:
     assert executor.executed_sql == []
 
 
-def test_validation_rejects_a_non_positive_timeout() -> None:
-    with pytest.raises(DatabaseExecutionError, match="greater than 0"):
-        _executor(FakeResponse(value=1)).validate_syntax("SELECT 1", 0)
+def test_validation_accepts_a_non_positive_timeout_as_no_limit() -> None:
+    _executor(FakeResponse(value=1)).validate_syntax("SELECT 1", 0)
 
 
 def test_a_fixture_can_script_a_syntax_error_per_side() -> None:

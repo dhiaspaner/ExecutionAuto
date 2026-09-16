@@ -28,7 +28,7 @@ from .errors import ReconciliationError
 from .execution.connections import SectionExecutors, resolve_section_settings
 from .execution.engine import RunReport, execute_plan, new_run_id
 from .execution.plan import ExecutionPlan, build_plan
-from .models import RunSummary, WorkbookSchema
+from .models import RunMode, RunSummary, WorkbookSchema
 from .profile import RunProfile, load_profile
 from .reporting import make_output_encoding_safe, render_run_report, render_summary
 from .runner import ReconciliationRunner, RunOptions
@@ -165,6 +165,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Validate everything and open nothing. Runs no reconciliation SQL.",
+    )
+    run.add_argument(
+        "--mode",
+        choices=[mode.value for mode in RunMode],
+        default=RunMode.EXECUTE.value,
+        help=(
+            "'validate' connects and asks the database to compile every query, writes the "
+            "validation sheets and stops without executing anything. 'execute' (the default) "
+            "runs that same check first and only executes when every query compiled. "
+            "Unlike --dry-run, 'validate' does open the databases."
+        ),
     )
     run.add_argument(
         "--non-interactive",
@@ -327,6 +338,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         run_id=new_run_id(),
         output_dir=args.output_dir,
         write_output=not args.no_write,
+        on_progress=_emit,
+        mode=RunMode(args.mode),
     )
     _report_run(report)
     if report.dry_run:
@@ -381,7 +394,7 @@ def _report_plan(plan: ExecutionPlan, workbook_path: Path, sheet_name: str) -> N
     )
     _emit(f"  connections   : {', '.join(plan.required_sections) or 'none required'}")
     _emit(
-        f"  timeout       : {plan.control.query_timeout_seconds}s per query   "
+        f"  timeout       : {_describe_timeout(plan.control.query_timeout_seconds)}   "
         f"output mode: {plan.control.output_mode.value}"
         f"{'   DRY RUN' if plan.control.dry_run else ''}"
     )
@@ -443,6 +456,13 @@ def _report(summary: RunSummary) -> None:
     note = "  No result workbook written (--no-write)."
     for line in render_summary(summary, no_output_note=note):
         _emit(line)
+
+
+def _describe_timeout(seconds: int) -> str:
+    """Render the query timeout, including the case where there is not one."""
+    if seconds <= 0:
+        return "no query timeout"
+    return f"{seconds}s per query"
 
 
 def _emit(message: str) -> None:

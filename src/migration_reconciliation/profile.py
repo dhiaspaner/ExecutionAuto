@@ -40,7 +40,7 @@ __all__ = [
 SUPPORTED_PROFILE_VERSIONS: frozenset[str] = frozenset({"1.0"})
 
 _ALLOWED_TOP_LEVEL_KEYS = frozenset({"version", "workbook", "source", "target"})
-_ALLOWED_WORKBOOK_KEYS = frozenset({"path", "sheet"})
+_ALLOWED_WORKBOOK_KEYS = frozenset({"path", "sheet", "schema"})
 _ALLOWED_SOURCE_KEYS = frozenset(
     {
         "type",
@@ -121,6 +121,9 @@ class RunProfile:
     target: ConnectionProfile
     workbook_path: Path | None = None
     sheet_name: str | None = None
+    #: The workbook schema DSL to read the sheet with. ``None`` leaves the
+    #: caller to decide what layout to assume.
+    schema_path: Path | None = None
     #: Where it came from, for the "taken from the profile" messages.
     source_path: str = "<profile>"
     #: True when ``[target].type`` was absent and the source engine was reused.
@@ -169,6 +172,7 @@ def parse_profile(document: dict[str, Any], *, source: str = "<profile>") -> Run
     _reject_unknown(workbook, _ALLOWED_WORKBOOK_KEYS, source, where="[workbook]")
     workbook_path = _optional_string(workbook, "path", source, "[workbook]")
     sheet_name = _optional_string(workbook, "sheet", source, "[workbook]")
+    schema_path = _optional_string(workbook, "schema", source, "[workbook]")
 
     source_table = _table(document, "source", source)
     _reject_unknown(source_table, _ALLOWED_SOURCE_KEYS, source, where="[source]")
@@ -221,6 +225,7 @@ def parse_profile(document: dict[str, Any], *, source: str = "<profile>") -> Run
         target=target_profile,
         workbook_path=Path(workbook_path).expanduser() if workbook_path else None,
         sheet_name=sheet_name,
+        schema_path=Path(schema_path).expanduser() if schema_path else None,
         source_path=source,
         target_type_inherited=target_inherited,
         warnings=tuple(warnings),

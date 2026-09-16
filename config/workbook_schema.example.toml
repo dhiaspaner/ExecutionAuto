@@ -83,6 +83,17 @@ required = true
 read = true
 write = false
 
+# This template has no Execution_Scope column, so every row runs both sides.
+# The header text is a sentinel that cannot match a real column; a template
+# that adds the column only has to name it here.
+[fields.execution_scope]
+header = "(not present in template — defaults to SOURCE_TARGET)"
+type = "enum"
+allowed_values = ["SOURCE_TARGET", "SOURCE_ONLY", "TARGET_ONLY"]
+required = false
+default = "SOURCE_TARGET"
+read = true
+
 [fields.source_connection]
 header = "Source Connection"
 type = "string"
@@ -128,16 +139,25 @@ default = 0
 read = true
 write = false
 
+# 0 means no limit. A row may still set a positive number in this column to
+# cap one slow query.
 [fields.timeout_seconds]
 header = "Timeout Seconds"
 type = "integer"
 required = false
-default = 120
+default = 0
 read = true
 write = false
 
 [fields.expected_result]
 header = "Expected Result"
+type = "string"
+required = false
+read = true
+write = false
+
+[fields.test_name]
+header = "Test Name"
 type = "string"
 required = false
 read = true
@@ -178,7 +198,15 @@ write = true
 [fields.status]
 header = "Status"
 type = "enum"
-allowed_values = ["PASS", "FAIL", "ERROR", "SKIPPED"]
+allowed_values = [
+  "PASS",
+  "FAIL",
+  "PROFILED",
+  "VALIDATED",
+  "NOT EXECUTED",
+  "ERROR",
+  "SKIPPED",
+]
 required = true
 read = false
 write = true

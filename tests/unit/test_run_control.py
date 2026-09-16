@@ -62,7 +62,7 @@ def test_an_unsupported_template_version_stops_the_run(
     assert caught.value.code == ErrorCode.UNSUPPORTED_TEMPLATE_VERSION
 
 
-@pytest.mark.parametrize("value", [0, -5, 100000, "soon"])
+@pytest.mark.parametrize("value", [-5, 100000, "soon"])
 def test_a_timeout_outside_the_allowed_range_is_refused(
     make_recon_workbook: Any, test_row: Any, run_control_settings: Any, value: object
 ) -> None:
@@ -72,6 +72,17 @@ def test_a_timeout_outside_the_allowed_range_is_refused(
 
     with pytest.raises(ConfigurationError, match="Query_Timeout_Seconds"):
         control_of(path)
+
+
+def test_a_timeout_of_zero_means_no_limit(
+    make_recon_workbook: Any, test_row: Any, run_control_settings: Any
+) -> None:
+    """0 is how the sheet asks for an unlimited query, so it must parse."""
+    path = make_recon_workbook(
+        [test_row()], run_control=run_control_settings(Query_Timeout_Seconds=0)
+    )
+
+    assert control_of(path).query_timeout_seconds == 0
 
 
 def test_yes_and_no_are_read_as_booleans(

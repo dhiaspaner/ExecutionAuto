@@ -64,11 +64,16 @@ def workbook(tmp_path: Path) -> Path:
 def answers_for(
     workbook: Path,
     *,
+    sheet: str | None = SHEET,
     source_type: str = "sqlserver",
     source_auth: str = "password",
     target_auth: str = "password",
 ) -> list[str]:
-    common = [str(workbook), SHEET, source_type, "legacy-host", "", "LegacyDb"]
+    """The keyboard answers for one run. ``sheet=None`` when it is not asked for."""
+    common = [str(workbook)]
+    if sheet is not None:
+        common.append(sheet)
+    common += [source_type, "legacy-host", "", "LegacyDb"]
     if source_type == "sqlserver":
         common.append("y")  # trust the source certificate
         common.append(source_auth)
@@ -262,7 +267,20 @@ def test_no_password_flag_exists() -> None:
     parser = run_reconciliation.build_parser()
     flags = {action.option_strings[0] for action in parser._actions if action.option_strings}
 
-    assert flags == {"-h", "--profile", "--case", "--limit", "--output-dir"}
+    assert flags == {
+        "-h",
+        "--profile",
+        "--schema",
+        "--mode",
+        "--on-syntax-error",
+        "--case",
+        "--limit",
+        "--output-dir",
+    }
+    # The guarantee this test exists for: nothing here accepts a credential.
+    assert not any(
+        word in flag for flag in flags for word in ("password", "pwd", "secret", "token", "user")
+    )
     assert not any("password" in flag for flag in flags)
     assert not any("server" in flag or "user" in flag for flag in flags)
 
@@ -285,9 +303,15 @@ def test_an_unreachable_source_stops_the_run_with_a_sanitized_message(
     assert SOURCE_SECRET not in captured.err + captured.out
 
 
-def test_a_failing_query_becomes_one_error_row_not_a_dead_run(
+def test_a_query_the_server_will_not_compile_is_an_error_and_the_rest_still_run(
     workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
 ) -> None:
+    """An invalid object name is caught by the compile pass, not by executing it.
+
+    ``SET NOEXEC ON`` rejects an unknown table, so the run finds it before
+    executing anything. That test is recorded as ERROR and the two sound
+    queries still run: one broken row costs one result, not all of them.
+    """
     console.script(answers_for(workbook))
     source = scripted_connection(
         {
@@ -303,7 +327,12 @@ def test_a_failing_query_becomes_one_error_row_not_a_dead_run(
 
     out = capsys.readouterr().out
     assert code == run_reconciliation.EXIT_FAILURES
-    assert "2 passed, 0 failed, 1 errors, 0 skipped" in out
+    assert "Validation phase" in out
+    assert "recorded as ERROR" in out
+    assert "Invalid object name" in out
+    # The sound queries still ran.
+    assert "Execution phase" in out
+    assert "2 passed" in out
 
 
 def test_unsafe_sql_is_rejected_before_it_reaches_the_database(
@@ -392,7 +421,8 @@ def test_optional_columns_are_honoured_when_present_and_defaulted_when_absent() 
     assert schema.field("comparison_rule").header == "Comparison Rule"
     assert schema.field("comparison_rule").default == "equal"
     assert schema.field("comparison_rule").required is False
-    assert schema.field("timeout_seconds").default == 120
+    # 0 means no limit: the runner imposes no query timeout of its own.
+    assert schema.field("timeout_seconds").default == 0
 
 
 # -- Windows authentication and profiles, end to end ---------------------
@@ -570,3 +600,316 @@ def test_a_missing_profile_file_is_reported(
 
     assert code == run_reconciliation.EXIT_USAGE
     assert "Cannot read profile" in capsys.readouterr().err
+
+
+# -- the workbook schema DSL ---------------------------------------------
+
+DSL_SHEET = "Definitions"
+DSL_SECOND_SHEET = "Definitions Q4"
+
+#: Deliberately unlike the runner's fixed layout: a title band above the
+#: headers, and not one header text the runner knows by heart.
+DSL_HEADERS = [
+    "Case",
+    "Run?",
+    "Source Statement",
+    "Target Statement",
+    "Src Value",
+    "Tgt Value",
+    "Delta",
+    "Outcome",
+    "Notes",
+]
+
+DSL_HEADER_ROW = 3
+DSL_FIRST_DATA_ROW = 4
+
+SCHEMA_TOML = """\
+schema_version = "1.0"
+profile_name = "dsl-under-test"
+
+[workbook]
+test_case_sheet = "{sheet}"
+header_row = {header_row}
+first_data_row = {first_data_row}
+preserve_other_sheets = true
+output_filename_pattern = "{{input_stem}}_results_{{timestamp}}.xlsx"
+
+[fields.test_case_id]
+header = "Case"
+type = "string"
+required = true
+read = true
+
+[fields.enabled]
+header = "Run?"
+type = "boolean"
+required = false
+default = true
+read = true
+
+[fields.source_sql]
+header = "Source Statement"
+type = "sql"
+required = true
+read = true
+
+[fields.target_sql]
+header = "Target Statement"
+type = "sql"
+required = true
+read = true
+
+[fields.execution_scope]
+header = "Not A Column: Execution Scope"
+type = "enum"
+allowed_values = ["SOURCE_TARGET", "SOURCE_ONLY", "TARGET_ONLY"]
+required = false
+default = "SOURCE_TARGET"
+read = true
+
+[fields.source_type]
+header = "Not A Column: Source Type"
+type = "enum"
+allowed_values = ["sqlserver", "oracle"]
+required = false
+default = "sqlserver"
+read = true
+
+[fields.source_connection]
+header = "Not A Column: Source Connection"
+type = "string"
+required = false
+default = "SOURCE"
+read = true
+
+[fields.target_connection]
+header = "Not A Column: Target Connection"
+type = "string"
+required = false
+default = "TARGET"
+read = true
+
+[fields.source_result]
+header = "Src Value"
+type = "scalar"
+required = false
+write = true
+
+[fields.target_result]
+header = "Tgt Value"
+type = "scalar"
+required = false
+write = true
+
+[fields.variance]
+header = "Delta"
+type = "decimal"
+required = false
+write = true
+
+[fields.status]
+header = "Outcome"
+type = "enum"
+allowed_values = ["PASS", "FAIL", "ERROR", "SKIPPED"]
+required = false
+write = true
+
+[fields.remarks]
+header = "Notes"
+type = "string"
+required = false
+write = true
+
+[fields.executed_at]
+header = "Not A Column: Executed At"
+type = "datetime"
+required = false
+write = true
+
+[fields.run_id]
+header = "Not A Column: Run ID"
+type = "string"
+required = false
+write = true
+
+[fields.duration_ms]
+header = "Not A Column: Duration"
+type = "integer"
+required = false
+write = true
+
+[fields.error_side]
+header = "Not A Column: Error Side"
+type = "enum"
+allowed_values = ["SOURCE", "TARGET", "COMPARISON", "WORKBOOK", ""]
+required = false
+write = true
+"""
+
+
+def dsl_sheet(book: Workbook, title: str, cases: list[tuple[str, str, str]]) -> None:
+    """One sheet in the DSL layout: banner, blank line, headers, then rows."""
+    sheet = book.create_sheet(title)
+    sheet.append([f"{title} - definitions above, results to the right"] * len(DSL_HEADERS))
+    sheet.append([])
+    sheet.append(DSL_HEADERS)
+    for case in cases:
+        sheet.append([case[0], "Yes", case[1], case[2]])
+
+
+@pytest.fixture
+def dsl_workbook(tmp_path: Path) -> Path:
+    """A workbook no fixed-layout reader can read: the headers sit on row 3."""
+    book = Workbook()
+    book.remove(book.active)
+    dsl_sheet(book, DSL_SHEET, CASES)
+    dsl_sheet(book, DSL_SECOND_SHEET, CASES[:1])
+
+    path = tmp_path / "payments_dsl.xlsx"
+    book.save(path)
+    book.close()
+    return path
+
+
+def schema_file(
+    tmp_path: Path,
+    *,
+    sheet: str = DSL_SHEET,
+    header_row: int = DSL_HEADER_ROW,
+    first_data_row: int = DSL_FIRST_DATA_ROW,
+) -> Path:
+    path = tmp_path / "schema.toml"
+    path.write_text(
+        SCHEMA_TOML.format(sheet=sheet, header_row=header_row, first_data_row=first_data_row),
+        encoding="utf-8",
+    )
+    return path
+
+
+def profile_file(tmp_path: Path, workbook_table: str) -> Path:
+    path = tmp_path / "profile.toml"
+    path.write_text(f'version = "1.0"\n\n[workbook]\n{workbook_table}\n', encoding="utf-8")
+    return path
+
+
+def test_a_schema_decides_the_sheet_the_header_row_and_the_headers(
+    dsl_workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any, tmp_path: Path
+) -> None:
+    console.script(answers_for(dsl_workbook, sheet=None))
+    source = scripted_connection({CASES[0][1]: 1500, CASES[1][1]: 98765, CASES[2][1]: 12})
+    target = scripted_connection({CASES[0][2]: 1500, CASES[1][2]: 98765, CASES[2][2]: 11})
+    use_drivers(monkeypatch, FakePyodbc(connection=source), FakePyodbc(connection=target))
+
+    code = run_reconciliation.main(["--schema", str(schema_file(tmp_path))])
+
+    out = capsys.readouterr().out
+    assert code == run_reconciliation.EXIT_FAILURES  # TC-003 legitimately mismatches
+    assert "2 passed, 1 failed, 0 errors, 0 skipped" in out
+    assert "headers on row 3" in out
+
+    written = load_workbook(next(tmp_path.glob("payments_dsl_results_*.xlsx")))
+    sheet = written[DSL_SHEET]
+    assert [cell.value for cell in sheet[DSL_HEADER_ROW]] == DSL_HEADERS
+    assert sheet["E4"].value == 1500  # Src Value
+    assert sheet["F4"].value == 1500  # Tgt Value
+    assert sheet["H4"].value == "PASS"  # Outcome
+    assert sheet["H6"].value == "FAIL"
+    written.close()
+
+
+def test_a_schema_names_the_columns_before_the_first_question(
+    dsl_workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any, tmp_path: Path
+) -> None:
+    console.script(answers_for(dsl_workbook, sheet=None))
+    use_drivers(monkeypatch, FakePyodbc(), FakePyodbc())
+
+    run_reconciliation.main(["--schema", str(schema_file(tmp_path)), "--limit", "1"])
+
+    banner = capsys.readouterr().out.split("Workbook")[0]
+    assert "Case, Source Statement, Target Statement" in banner
+    assert "Src Value, Tgt Value, Delta, Outcome, Notes" in banner
+    assert "dsl-under-test" in banner
+    # The fixed layout's own header text must not be claimed for this workbook.
+    assert "Source SQL" not in banner
+
+
+def test_the_profile_can_name_the_schema(
+    dsl_workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profile_file(tmp_path, f'schema = "{schema_file(tmp_path).as_posix()}"')
+    console.script(answers_for(dsl_workbook, sheet=None))
+    use_drivers(monkeypatch, FakePyodbc(), FakePyodbc())
+
+    code = run_reconciliation.main(["--profile", str(profile)])
+
+    assert code == run_reconciliation.EXIT_OK
+    assert list(tmp_path.glob("payments_dsl_results_*.xlsx"))
+
+
+def test_the_flag_overrides_the_schema_the_profile_names(
+    dsl_workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    unusable = tmp_path / "wrong.toml"
+    unusable.write_text('schema_version = "9.9"\n', encoding="utf-8")
+    profile = profile_file(tmp_path, f'schema = "{unusable.as_posix()}"')
+    console.script(answers_for(dsl_workbook, sheet=None))
+    use_drivers(monkeypatch, FakePyodbc(), FakePyodbc())
+
+    code = run_reconciliation.main(
+        ["--profile", str(profile), "--schema", str(schema_file(tmp_path))]
+    )
+
+    assert code == run_reconciliation.EXIT_OK
+
+
+def test_the_answered_sheet_wins_over_the_one_the_schema_declares(
+    dsl_workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    before = load_workbook(dsl_workbook)
+    untouched = [cell.value for cell in before[DSL_SHEET][DSL_FIRST_DATA_ROW]]
+    before.close()
+
+    profile = profile_file(
+        tmp_path,
+        f'sheet = "{DSL_SECOND_SHEET}"\nschema = "{schema_file(tmp_path).as_posix()}"',
+    )
+    console.script(answers_for(dsl_workbook, sheet=None))
+    connection = scripted_connection({CASES[0][1]: 7, CASES[0][2]: 7})
+    use_drivers(monkeypatch, FakePyodbc(connection=connection), FakePyodbc(connection=connection))
+
+    code = run_reconciliation.main(["--profile", str(profile)])
+
+    assert code == run_reconciliation.EXIT_OK
+    written = load_workbook(next(tmp_path.glob("payments_dsl_results_*.xlsx")))
+    assert written[DSL_SECOND_SHEET]["H4"].value == "PASS"
+    assert [cell.value for cell in written[DSL_SHEET][DSL_FIRST_DATA_ROW]] == untouched
+    written.close()
+
+
+def test_an_unreadable_schema_stops_the_run_before_a_single_question(
+    dsl_workbook: Path, console: Any, capsys: Any, tmp_path: Path
+) -> None:
+    broken = tmp_path / "broken.toml"
+    broken.write_text('schema_version = "9.9"\nprofile_name = "nope"\n', encoding="utf-8")
+    console.script(answers_for(dsl_workbook, sheet=None))
+
+    code = run_reconciliation.main(["--schema", str(broken)])
+
+    assert code == run_reconciliation.EXIT_USAGE
+    assert "unsupported schema_version" in capsys.readouterr().err
+    # Nothing was asked, so every scripted answer is still waiting.
+    assert len(console.answers) == len(answers_for(dsl_workbook, sheet=None))
+
+
+def test_without_a_schema_the_runners_own_layout_still_applies(
+    workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any, tmp_path: Path
+) -> None:
+    console.script(answers_for(workbook))
+    use_drivers(monkeypatch, FakePyodbc(), FakePyodbc())
+
+    code = run_reconciliation.main([])
+
+    assert code == run_reconciliation.EXIT_OK
+    assert "ID, Source SQL, Target SQL" in capsys.readouterr().out
+    assert list(tmp_path.glob("payments_domain_results_*.xlsx"))

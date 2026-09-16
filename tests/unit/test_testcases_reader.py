@@ -431,6 +431,7 @@ def test_the_status_vocabulary_is_the_documented_one() -> None:
         "PASS",
         "FAIL",
         "PROFILED",
+        "VALIDATED",
         "ERROR",
         "SYNTAX ERROR",
         "BLOCKED",

@@ -10,8 +10,11 @@ Two different timeouts matter here and are easy to confuse:
     How long to wait for the *login* to complete. This is what makes an
     unreachable host fail quickly instead of hanging.
 
-``cursor.timeout``
-    How long to wait for a *query*. Comes from the workbook's timeout column.
+``connection.timeout``
+    How long to wait for a *query*. Comes from the workbook's timeout column,
+    and ``0`` means no limit. It belongs to the connection: a pyodbc *cursor*
+    has no ``timeout`` attribute at all, and assigning one raises
+    ``AttributeError`` against the real driver.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ from ..errors import (
 )
 from ..models import ConnectionIdentity, ScalarValue
 from ..security.redaction import sanitize_error
-from .base import single_scalar
+from .base import normalize_timeout, single_scalar
 from .failures import (
     FailureCause,
     classify_failure,
@@ -109,17 +112,13 @@ class SqlServerExecutor:
         the run. It is switched off in a ``finally``, and a session whose
         switch-off did not confirm is dropped rather than reused.
         """
-        if timeout_seconds <= 0:
-            raise DatabaseExecutionError(
-                f"Timeout must be greater than 0 seconds (got {timeout_seconds})"
-            )
         self.connect()
         assert self._connection is not None  # connect() raises otherwise
         label = f"{self._settings.side.value.capitalize()} query"
 
+        self._connection.timeout = normalize_timeout(timeout_seconds)
         cursor = self._connection.cursor()
         try:
-            cursor.timeout = timeout_seconds
             try:
                 cursor.execute("SET NOEXEC ON")
             except Exception as exc:
@@ -161,17 +160,13 @@ class SqlServerExecutor:
         happens. At most two rows are fetched, so a query that wrongly matches
         a whole table never pulls that table into this process.
         """
-        if timeout_seconds <= 0:
-            raise DatabaseExecutionError(
-                f"Timeout must be greater than 0 seconds (got {timeout_seconds})"
-            )
         self.connect()
         assert self._connection is not None  # connect() raises otherwise
         label = f"{self._settings.side.value.capitalize()} query"
 
+        self._connection.timeout = normalize_timeout(timeout_seconds)
         cursor = self._connection.cursor()
         try:
-            cursor.timeout = timeout_seconds
             try:
                 cursor.execute(sql)
             except Exception as exc:

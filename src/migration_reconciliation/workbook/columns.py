@@ -26,6 +26,10 @@ __all__ = [
     "RUN_HISTORY_COLUMNS",
     "RUN_HISTORY_SHEET",
     "TEST_CASES_SHEET",
+    "VALIDATION_COLUMNS",
+    "VALIDATION_ERRORS_COLUMNS",
+    "VALIDATION_ERRORS_SHEET",
+    "VALIDATION_SHEET",
     "normalize_header",
 ]
 
@@ -35,6 +39,16 @@ RUN_CONTROL_SHEET = "Run Control"
 OBSERVATION_RULES_SHEET = "Observation Rules"
 COMPARISON_TYPES_SHEET = "Comparison Types"
 RUN_HISTORY_SHEET = "Run History"
+
+#: Written only when pass 1 refuses to let the run proceed. It names every
+#: query the database would not compile, so all of them can be fixed in one
+#: sitting instead of one run each.
+VALIDATION_ERRORS_SHEET = "Validation Errors"
+
+#: The full record of the pre-execution check: one row per test, whether it
+#: compiled or not. Written on every run, so a clean run still shows that every
+#: query was put to the database before any of them ran.
+VALIDATION_SHEET = "Syntax Validation"
 
 #: Sheets that are documentation or a TOML example, and are never parsed for
 #: instructions, connection settings or executable actions. They are listed so
@@ -113,6 +127,34 @@ REQUIRED_OUTPUT_COLUMNS: tuple[str, ...] = ("Status", "Observation", "Error_Code
 #: Columns earlier templates carried. They are read for display only: a
 #: workbook can describe what it wants done, it can never issue a command.
 LEGACY_COLUMNS: tuple[str, ...] = ("Priority", "Executor_Action")
+
+#: One row per query that failed validation. Rewritten every run: it describes
+#: the run that just happened, not a history. Carries no SQL and no row data —
+#: only the test's identity and the database's own sanitized complaint.
+VALIDATION_ERRORS_COLUMNS: tuple[str, ...] = (
+    "Run_ID",
+    "Checked_At_UTC",
+    "Test_ID",
+    "Row",
+    "Status",
+    "Platform",
+    "Error_Code",
+    "Error_Detail",
+)
+
+#: One row per test checked. ``Result`` is OK, SYNTAX ERROR, or NOT CHECKED
+#: when the database could not be asked — which proves nothing about the SQL
+#: and must never be read as if it did.
+VALIDATION_COLUMNS: tuple[str, ...] = (
+    "Run_ID",
+    "Checked_At_UTC",
+    "Test_ID",
+    "Row",
+    "Result",
+    "Platform",
+    "Error_Code",
+    "Error_Detail",
+)
 
 #: One row per run, appended and never rewritten.
 RUN_HISTORY_COLUMNS: tuple[str, ...] = (

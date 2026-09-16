@@ -133,19 +133,11 @@ class FakeQueryExecutor:
     def validate_syntax(self, sql: str, timeout_seconds: int) -> None:
         """Answer from the script, and execute nothing whatever the answer is."""
         self._assert_open()
-        if timeout_seconds <= 0:
-            raise DatabaseExecutionError(
-                f"Timeout must be greater than 0 seconds (got {timeout_seconds})"
-            )
         self.validated_sql.append(sql)
         self.response.check(label=f"{self.side.value.capitalize()} query")
 
     def execute_scalar(self, sql: str, timeout_seconds: int) -> ScalarValue:
         self._assert_open()
-        if timeout_seconds <= 0:
-            raise DatabaseExecutionError(
-                f"Timeout must be greater than 0 seconds (got {timeout_seconds})"
-            )
         self.executed_sql.append(sql)
         return self.response.resolve(label=f"{self.side.value.capitalize()} query")
 

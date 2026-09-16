@@ -24,13 +24,14 @@ from __future__ import annotations
 import contextlib
 import os
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 from ..errors import WorkbookError
 from .columns import (
@@ -38,6 +39,10 @@ from .columns import (
     OUTPUT_COLUMNS,
     RUN_HISTORY_COLUMNS,
     RUN_HISTORY_SHEET,
+    VALIDATION_COLUMNS,
+    VALIDATION_ERRORS_COLUMNS,
+    VALIDATION_ERRORS_SHEET,
+    VALIDATION_SHEET,
     normalize_header,
 )
 from .run_control import OutputMode
@@ -166,6 +171,46 @@ class ResultWriter:
             cell.value = _cell_value(value)
             if isinstance(value, datetime):
                 cell.number_format = _DATETIME_FORMAT
+
+    def write_validation_report(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Replace ``Syntax Validation``: every test the check looked at."""
+        self._replace_report_sheet(VALIDATION_SHEET, VALIDATION_COLUMNS, rows)
+
+    def write_validation_errors(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Replace ``Validation Errors``: just the queries that were rejected."""
+        self._replace_report_sheet(VALIDATION_ERRORS_SHEET, VALIDATION_ERRORS_COLUMNS, rows)
+
+    def _replace_report_sheet(
+        self, name: str, headers: Sequence[str], rows: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Rewrite one report sheet, or leave none behind.
+
+        These sheets describe one run, so they are rewritten rather than
+        appended to: a clean run must not leave the previous run's broken
+        queries on screen for someone to act on.
+        """
+        existing = find_sheet(self._workbook, name)
+        if existing is not None:
+            self._workbook.remove(existing)
+        if not rows:
+            return
+
+        sheet = self._workbook.create_sheet(name)
+        for column, header in enumerate(headers, start=1):
+            sheet.cell(row=1, column=column, value=header)
+
+        for offset, values in enumerate(rows, start=2):
+            for column, header in enumerate(headers, start=1):
+                value = values.get(header)
+                cell = sheet.cell(row=offset, column=column)
+                cell.value = _cell_value(value)
+                if isinstance(value, datetime):
+                    cell.number_format = _DATETIME_FORMAT
+
+        widths = {"Test_ID": 18, "Error_Code": 24, "Error_Detail": 90, "Checked_At_UTC": 20}
+        for column, header in enumerate(headers, start=1):
+            sheet.column_dimensions[get_column_letter(column)].width = widths.get(header, 14)
+        sheet.freeze_panes = "A2"
 
     def plan_destination(
         self,

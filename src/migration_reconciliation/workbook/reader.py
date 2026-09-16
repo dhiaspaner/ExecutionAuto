@@ -28,6 +28,7 @@ from ..errors import WorkbookError
 from ..models import (
     ComparisonRule,
     DatabaseType,
+    ExecutionScope,
     FieldDefinition,
     FieldType,
     TestCase,
@@ -179,7 +180,7 @@ def _read_rows(
             continue
 
         if not values["enabled"]:
-            result.skipped.append(SkippedRow(row_number, test_case_id, "Disabled in the workbook"))
+            result.skipped.append(SkippedRow(row_number, test_case_id, _disabled_reason(values)))
             continue
 
         result.test_cases.append(_build_test_case(test_case_id, row_number, values, schema))
@@ -192,15 +193,75 @@ def _read_rows(
     return result
 
 
+#: Fields that belong to one side only. A test that does not use that side
+#: must leave them empty, and is not asked for them.
+_SOURCE_SIDE_FIELDS = frozenset({"source_connection", "source_sql"})
+_TARGET_SIDE_FIELDS = frozenset({"target_connection", "target_sql"})
+
+
+def _scope_for(
+    row: tuple[Any, ...], schema: WorkbookSchema, column_map: dict[str, int]
+) -> ExecutionScope:
+    """The scope this row declares, read before anything else depends on it."""
+    definition = schema.fields.get("execution_scope")
+    if definition is None or not definition.read:
+        return ExecutionScope.SOURCE_TARGET
+    raw = _cell(row, column_map.get("execution_scope"))
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        if definition.required:
+            raise WorkbookError(f"Column '{definition.header}' is required but empty")
+        default = _default_for(definition)
+        return ExecutionScope(default) if default else ExecutionScope.SOURCE_TARGET
+    return ExecutionScope(_coerce(raw, definition))
+
+
+#: A disabled row's own words are worth more than the framework's. Capped so
+#: one very long cell cannot crowd out the rest of a result sheet.
+_DISABLED_REASON_CHARS = 300
+
+
+def _disabled_reason(values: dict[str, Any]) -> str:
+    """Why this row was skipped, quoting the workbook when it says.
+
+    Whoever turned a test off usually wrote down why, and that note is more
+    use to the next reader than "disabled" repeated down the column. When the
+    schema maps no name field, or the cell is empty, the plain statement is
+    all there is to say.
+    """
+    note = values.get("test_name")
+    text = " ".join(str(note).split()) if note is not None else ""
+    if not text:
+        return "Disabled in the workbook"
+    if len(text) > _DISABLED_REASON_CHARS:
+        text = f"{text[:_DISABLED_REASON_CHARS].rstrip()}..."
+    return f"Disabled in the workbook: {text}"
+
+
 def _read_field_values(
     row: tuple[Any, ...], schema: WorkbookSchema, column_map: dict[str, int]
 ) -> dict[str, Any]:
-    values: dict[str, Any] = {}
+    scope = _scope_for(row, schema, column_map)
+    values: dict[str, Any] = {"execution_scope": scope}
     for definition in schema.fields.values():
-        if not definition.read:
+        if not definition.read or definition.name == "execution_scope":
             continue
+        # A side the scope does not name is neither required nor permitted:
+        # a populated unused side means the row and its scope disagree, and
+        # guessing which one is right would run a query nobody asked for.
+        unused = (definition.name in _SOURCE_SIDE_FIELDS and not scope.uses_source) or (
+            definition.name in _TARGET_SIDE_FIELDS and not scope.uses_target
+        )
         raw = _cell(row, column_map.get(definition.name))
-        if raw is None or (isinstance(raw, str) and not raw.strip()):
+        blank = raw is None or (isinstance(raw, str) and not raw.strip())
+        if unused:
+            if not blank:
+                raise WorkbookError(
+                    f"Column '{definition.header}' must be empty when "
+                    f"Execution_Scope is {scope.value}"
+                )
+            values[definition.name] = ""
+            continue
+        if blank:
             if definition.required:
                 raise WorkbookError(f"Column '{definition.header}' is required but empty")
             values[definition.name] = _default_for(definition)
@@ -215,6 +276,7 @@ def _build_test_case(
     core = {
         "test_case_id",
         "enabled",
+        "execution_scope",
         "source_type",
         "source_connection",
         "target_connection",
@@ -237,9 +299,10 @@ def _build_test_case(
         target_connection=str(values["target_connection"]),
         source_sql=str(values["source_sql"]),
         target_sql=str(values["target_sql"]),
+        execution_scope=values["execution_scope"],
         comparison_rule=ComparisonRule(values.get("comparison_rule") or ComparisonRule.EQUAL),
         tolerance=_as_decimal(values.get("tolerance")),
-        timeout_seconds=int(values.get("timeout_seconds") or 120),
+        timeout_seconds=int(values.get("timeout_seconds") or 0),
         enabled=True,
         extras=extras,
     )

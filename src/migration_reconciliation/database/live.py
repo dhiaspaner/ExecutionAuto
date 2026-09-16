@@ -77,7 +77,23 @@ class LiveExecutorFactory:
         test_case_id: str,
         side: QuerySide,
     ) -> QueryExecutor:
-        """Return the one executor for ``side``. Every case shares it."""
+        """Return the one executor for ``side``. Every case shares it.
+
+        A workbook that declares which engine a side speaks is taken at its
+        word: if it disagrees with the profile, the run stops instead of
+        quietly compiling one dialect against the other. Silently returning
+        the configured connection would let Oracle SQL be checked by SQL
+        Server, where a query valid in both dialects passes a check that
+        proved nothing about the database it will actually run on.
+        """
+        configured = self._settings[side].database_type
+        if database_type is not configured:
+            raise ReconciliationError(
+                f"Test '{test_case_id}' expects the {side.value} database to be "
+                f"{database_type.value}, but the profile configures {side.value} as "
+                f"{configured.value}. Point [{side.value}] at a {database_type.value} "
+                f"database, or correct the workbook."
+            )
         return self._executors[side]
 
     def close_all(self) -> None:

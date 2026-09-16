@@ -10,7 +10,12 @@ import pytest
 from openpyxl import load_workbook
 
 from migration_reconciliation.errors import WorkbookError
-from migration_reconciliation.models import ComparisonRule, DatabaseType, WorkbookSchema
+from migration_reconciliation.models import (
+    ComparisonRule,
+    DatabaseType,
+    ExecutionScope,
+    WorkbookSchema,
+)
 from migration_reconciliation.workbook.reader import read_workbook, validate_workbook
 from migration_reconciliation.workbook.schema import load_schema, parse_schema
 from tests.conftest import EXAMPLE_TEMPLATE_PATH, GENERIC_SCHEMA_PATH
@@ -274,3 +279,149 @@ def test_validate_workbook_does_not_modify_the_file(
     validate_workbook(path, schema)
 
     assert Path(path).read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# One-sided tests: a scope that names a single side is not asked for the other.
+# ---------------------------------------------------------------------------
+
+
+def test_target_only_row_needs_no_source_connection(
+    make_workbook: Any, case_row: Any, schema: WorkbookSchema
+) -> None:
+    """A TARGET_ONLY row leaves the whole source side empty and still reads."""
+    path = make_workbook(
+        [
+            case_row(
+                "TC-TGT-001",
+                execution_scope="TARGET_ONLY",
+                source_connection="",
+                source_sql="",
+                comparison_rule="expected_zero",
+            )
+        ]
+    )
+
+    read = read_workbook(path, schema)
+
+    assert read.invalid == []
+    assert len(read.test_cases) == 1
+    assert read.test_cases[0].execution_scope is ExecutionScope.TARGET_ONLY
+    assert read.test_cases[0].source_sql == ""
+
+
+def test_source_only_row_needs_no_target_connection(
+    make_workbook: Any, case_row: Any, schema: WorkbookSchema
+) -> None:
+    path = make_workbook(
+        [
+            case_row(
+                "TC-SRC-001",
+                execution_scope="SOURCE_ONLY",
+                target_connection="",
+                target_sql="",
+                comparison_rule="expected_zero",
+            )
+        ]
+    )
+
+    read = read_workbook(path, schema)
+
+    assert read.invalid == []
+    assert read.test_cases[0].execution_scope is ExecutionScope.SOURCE_ONLY
+    assert read.test_cases[0].target_sql == ""
+
+
+def test_a_populated_unused_side_is_rejected(
+    make_workbook: Any, case_row: Any, schema: WorkbookSchema
+) -> None:
+    """The row and its scope disagree, so the row is reported rather than guessed."""
+    path = make_workbook(
+        [
+            case_row(
+                "TC-TGT-002",
+                execution_scope="TARGET_ONLY",
+                source_connection="",
+                source_sql="SELECT COUNT(*) FROM PAYMENTS",
+            )
+        ]
+    )
+
+    read = read_workbook(path, schema)
+
+    assert read.test_cases == []
+    assert len(read.invalid) == 1
+    assert "must be empty when Execution_Scope is TARGET_ONLY" in read.invalid[0].message
+
+
+def test_both_sides_are_still_required_by_default(
+    make_workbook: Any, case_row: Any, schema: WorkbookSchema
+) -> None:
+    """Omitting the scope keeps the two-sided behaviour, so nothing loosens silently."""
+    path = make_workbook([case_row("TC-BOTH-001", source_sql="")])
+
+    read = read_workbook(path, schema)
+
+    assert read.test_cases == []
+    assert len(read.invalid) == 1
+    assert "is required but empty" in read.invalid[0].message
+
+
+# ---------------------------------------------------------------------------
+# A disabled row says why, in the workbook's own words.
+# ---------------------------------------------------------------------------
+
+
+def test_a_disabled_row_quotes_the_reason_from_the_workbook(
+    make_workbook: Any, case_row: Any, schema: WorkbookSchema
+) -> None:
+    path = make_workbook(
+        [
+            case_row(
+                "TC-OFF",
+                enabled=False,
+                test_name="No mapped Arabic-language attribute exists for this target table.",
+            )
+        ]
+    )
+
+    read = read_workbook(path, schema)
+
+    assert len(read.skipped) == 1
+    assert read.skipped[0].reason == (
+        "Disabled in the workbook: No mapped Arabic-language attribute exists "
+        "for this target table."
+    )
+
+
+def test_a_disabled_row_without_a_name_still_says_it_is_disabled(
+    make_workbook: Any, case_row: Any, schema: WorkbookSchema
+) -> None:
+    path = make_workbook([case_row("TC-OFF", enabled=False)])
+
+    read = read_workbook(path, schema)
+
+    assert read.skipped[0].reason == "Disabled in the workbook"
+
+
+def test_a_very_long_reason_is_truncated(
+    make_workbook: Any, case_row: Any, schema: WorkbookSchema
+) -> None:
+    """One enormous cell must not crowd out the rest of a result sheet."""
+    path = make_workbook([case_row("TC-OFF", enabled=False, test_name="x" * 500)])
+
+    read = read_workbook(path, schema)
+
+    assert read.skipped[0].reason.endswith("...")
+    assert len(read.skipped[0].reason) < 400
+
+
+def test_an_enabled_row_is_unaffected_by_its_name(
+    make_workbook: Any, case_row: Any, schema: WorkbookSchema
+) -> None:
+    path = make_workbook([case_row("TC-ON", test_name="Row counts match")])
+
+    read = read_workbook(path, schema)
+
+    assert read.skipped == []
+    assert len(read.test_cases) == 1

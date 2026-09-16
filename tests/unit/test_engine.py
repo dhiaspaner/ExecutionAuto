@@ -18,7 +18,7 @@ from migration_reconciliation.errors import (
 )
 from migration_reconciliation.execution.engine import RunReport, execute_plan
 from migration_reconciliation.execution.plan import ExecutionPlan, build_plan
-from migration_reconciliation.models import ErrorCode, Platform, TestStatus
+from migration_reconciliation.models import ErrorCode, Platform, RunMode, TestStatus
 from tests.scripted import ScriptedExecutors
 
 SOURCE_SQL = "SELECT COUNT(*) FROM webservice.dbo.Payments"
@@ -774,3 +774,300 @@ def test_a_disabled_row_is_never_validated(make_recon_workbook: Any, test_row: A
 
     assert all("TC-OFF" not in check.sql for check in executors.checks)
     assert len(executors.checks) == 2
+
+
+# ---------------------------------------------------------------------------
+# Progress logging, and the sheet that names every rejected query.
+# ---------------------------------------------------------------------------
+
+
+def _out_dir(tmp_path: Path) -> Path:
+    """An existing output directory; the writer refuses to create one."""
+    directory = tmp_path / "out"
+    directory.mkdir(exist_ok=True)
+    return directory
+
+
+def _log_of(path: Path, executors: ScriptedExecutors, **kwargs: Any) -> list[str]:
+    """Run and capture the progress lines the engine emitted."""
+    lines: list[str] = []
+    execute_plan(
+        plan_for(path),
+        executors=executors,
+        run_id="run-under-test",
+        write_output=False,
+        on_progress=lines.append,
+        **kwargs,
+    )
+    return lines
+
+
+def test_the_validation_phase_is_logged_query_by_query(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    path = make_recon_workbook([test_row("TC-001"), test_row("TC-002")])
+    executors = ScriptedExecutors(results={"source": 1, "target": 1})
+
+    lines = _log_of(path, executors)
+    joined = "\n".join(lines)
+
+    assert "Validation phase: compiling 2 query(s). No SQL is executed in this pass." in joined
+    assert "TC-001  ok" in joined
+    assert "TC-002  ok" in joined
+    assert "All 2 queries compiled. Nothing was rejected." in joined
+    # Only then does anything run, and it says so.
+    assert "Execution phase: running 2 test(s), one at a time." in joined
+    assert joined.index("Validation phase") < joined.index("Execution phase")
+
+
+def test_a_failed_validation_says_it_stopped_and_names_the_query(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    broken = test_row("TC-BAD", Source_SQL="SELECT COUNT(*) FROM Paymnets")
+    path = make_recon_workbook([test_row("TC-OK"), broken])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={
+            ("source", "SELECT COUNT(*) FROM Paymnets"): syntax_error("Invalid object name")
+        },
+    )
+
+    lines = _log_of(path, executors)
+    joined = "\n".join(lines)
+
+    assert "VALIDATION FAILED: 1 of 2 queries were rejected by the database." in joined
+    assert "TC-BAD" in joined
+    assert "Invalid object name" in joined
+    assert "Nothing was executed." in joined
+    assert "'Validation Errors' sheet" in joined
+    # The execution phase never announces itself, because it never happened.
+    assert "Execution phase" not in joined
+    assert not executors.executed_anything()
+
+
+def test_the_progress_log_never_carries_sql_or_a_connection_string(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    """The log is printed and may be redirected to a file, so it stays clean."""
+    path = make_recon_workbook([test_row("TC-001")])
+    executors = ScriptedExecutors(results={"source": 1, "target": 1})
+
+    joined = "\n".join(_log_of(path, executors))
+
+    assert SOURCE_SQL not in joined
+    assert TARGET_SQL not in joined
+    assert "PWD=" not in joined
+    assert "password" not in joined.casefold()
+
+
+def test_validation_failures_are_listed_for_the_error_sheet(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    broken = test_row("TC-BAD", Source_SQL="SELECT COUNT(*) FROM Paymnets")
+    path = make_recon_workbook([test_row("TC-OK"), broken])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={
+            ("source", "SELECT COUNT(*) FROM Paymnets"): syntax_error("Invalid object name")
+        },
+    )
+
+    report = run(path, executors)
+    rows = report.validation_error_rows()
+
+    assert [row["Test_ID"] for row in rows] == ["TC-BAD"]
+    row = rows[0]
+    assert row["Status"] == TestStatus.SYNTAX_ERROR.value
+    assert row["Platform"] == Platform.SOURCE.value
+    assert row["Error_Code"] == ErrorCode.SYNTAX_ERROR.value
+    assert "Invalid object name" in row["Error_Detail"]
+    assert row["Run_ID"] == "run-under-test"
+    # The row that compiled is not an error and must not appear.
+    assert all(r["Test_ID"] != "TC-OK" for r in rows)
+
+
+def test_a_clean_run_lists_no_validation_errors(make_recon_workbook: Any, test_row: Any) -> None:
+    path = make_recon_workbook([test_row("TC-001")])
+    executors = ScriptedExecutors(results={"source": 1, "target": 1})
+
+    assert run(path, executors).validation_error_rows() == ()
+
+
+def test_the_validation_errors_sheet_is_written_to_the_result_workbook(
+    make_recon_workbook: Any, test_row: Any, tmp_path: Path
+) -> None:
+    from openpyxl import load_workbook
+
+    broken = test_row("TC-BAD", Source_SQL="SELECT COUNT(*) FROM Paymnets")
+    path = make_recon_workbook([test_row("TC-OK"), broken])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={
+            ("source", "SELECT COUNT(*) FROM Paymnets"): syntax_error("Invalid object name")
+        },
+    )
+
+    report = execute_plan(
+        plan_for(path),
+        executors=executors,
+        run_id="run-under-test",
+        output_dir=_out_dir(tmp_path),
+        write_output=True,
+    )
+
+    assert report.output_path is not None
+    book = load_workbook(report.output_path)
+    assert "Validation Errors" in book.sheetnames
+    sheet = book["Validation Errors"]
+    headers = [cell.value for cell in sheet[1]]
+    assert headers == [
+        "Run_ID",
+        "Checked_At_UTC",
+        "Test_ID",
+        "Row",
+        "Status",
+        "Platform",
+        "Error_Code",
+        "Error_Detail",
+    ]
+    body = [[cell.value for cell in row] for row in sheet.iter_rows(min_row=2)]
+    assert len(body) == 1
+    assert body[0][headers.index("Test_ID")] == "TC-BAD"
+    assert "Invalid object name" in body[0][headers.index("Error_Detail")]
+    # The original workbook is never touched.
+    assert "Validation Errors" not in load_workbook(path).sheetnames
+
+
+def test_a_clean_run_leaves_no_validation_errors_sheet_behind(
+    make_recon_workbook: Any, test_row: Any, tmp_path: Path
+) -> None:
+    """A green run must not carry the previous run's rejected queries."""
+    from openpyxl import load_workbook
+
+    path = make_recon_workbook([test_row("TC-001")])
+    executors = ScriptedExecutors(results={"source": 1, "target": 1})
+
+    report = execute_plan(
+        plan_for(path),
+        executors=executors,
+        run_id="run-under-test",
+        output_dir=_out_dir(tmp_path),
+        write_output=True,
+    )
+
+    assert report.output_path is not None
+    assert "Validation Errors" not in load_workbook(report.output_path).sheetnames
+
+
+def test_the_syntax_validation_sheet_records_every_query_that_was_checked(
+    make_recon_workbook: Any, test_row: Any, tmp_path: Path
+) -> None:
+    """``reconcile run`` keeps the same full record as the schema-driven path."""
+    from openpyxl import load_workbook
+
+    broken = test_row("TC-BAD", Source_SQL="SELECT COUNT(*) FROM Paymnets")
+    path = make_recon_workbook([test_row("TC-OK"), broken])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={
+            ("source", "SELECT COUNT(*) FROM Paymnets"): syntax_error("Invalid object name")
+        },
+    )
+
+    report = execute_plan(
+        plan_for(path),
+        executors=executors,
+        run_id="run-under-test",
+        output_dir=_out_dir(tmp_path),
+        write_output=True,
+    )
+
+    assert report.output_path is not None
+    result = load_workbook(report.output_path)
+    assert "Syntax Validation" in result.sheetnames
+    sheet = result["Syntax Validation"]
+    headers = [cell.value for cell in sheet[1]]
+    body = [[cell.value for cell in row] for row in sheet.iter_rows(min_row=2)]
+    by_id = {row[headers.index("Test_ID")]: row for row in body}
+
+    assert set(by_id) == {"TC-OK", "TC-BAD"}
+    assert by_id["TC-OK"][headers.index("Result")] == "OK"
+    assert by_id["TC-BAD"][headers.index("Result")] == "SYNTAX ERROR"
+    assert "Invalid object name" in by_id["TC-BAD"][headers.index("Error_Detail")]
+
+
+def test_a_clean_run_still_writes_the_syntax_validation_sheet(
+    make_recon_workbook: Any, test_row: Any, tmp_path: Path
+) -> None:
+    from openpyxl import load_workbook
+
+    path = make_recon_workbook([test_row("TC-001"), test_row("TC-002")])
+    executors = ScriptedExecutors(results={"source": 1, "target": 1})
+
+    report = execute_plan(
+        plan_for(path),
+        executors=executors,
+        run_id="run-under-test",
+        output_dir=_out_dir(tmp_path),
+        write_output=True,
+    )
+
+    assert report.output_path is not None
+    result = load_workbook(report.output_path)
+    assert "Syntax Validation" in result.sheetnames
+    assert "Validation Errors" not in result.sheetnames
+    sheet = result["Syntax Validation"]
+    headers = [cell.value for cell in sheet[1]]
+    body = [[cell.value for cell in row] for row in sheet.iter_rows(min_row=2)]
+    assert len(body) == 2
+    assert {row[headers.index("Result")] for row in body} == {"OK"}
+
+
+def test_validate_mode_compiles_everything_and_executes_nothing(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    """``reconcile run --mode validate`` opens the databases but runs no test."""
+    path = make_recon_workbook([test_row("TC-001"), test_row("TC-002")])
+    executors = ScriptedExecutors(results={"source": 1, "target": 1})
+
+    lines: list[str] = []
+    report = execute_plan(
+        plan_for(path),
+        executors=executors,
+        run_id="run-under-test",
+        write_output=False,
+        on_progress=lines.append,
+        mode=RunMode.VALIDATE,
+    )
+    joined = "\n".join(lines)
+
+    assert not executors.executed_anything()
+    assert [o.status for o in report.outcomes] == [TestStatus.VALIDATED] * 2
+    assert report.overall_status == "PASS"
+    assert "Validation run: stopping here by request." in joined
+    assert "Execution phase" not in joined
+
+
+def test_validate_mode_still_closes_the_gate_on_bad_sql(
+    make_recon_workbook: Any, test_row: Any
+) -> None:
+    broken = test_row("TC-BAD", Source_SQL="SELECT COUNT(*) FROM Paymnets")
+    path = make_recon_workbook([test_row("TC-OK"), broken])
+    executors = ScriptedExecutors(
+        results={"source": 1, "target": 1},
+        syntax_failures={
+            ("source", "SELECT COUNT(*) FROM Paymnets"): syntax_error("Invalid object name")
+        },
+    )
+
+    report = execute_plan(
+        plan_for(path),
+        executors=executors,
+        run_id="run-under-test",
+        write_output=False,
+        mode=RunMode.VALIDATE,
+    )
+
+    assert outcome_of(report, "TC-BAD").status is TestStatus.SYNTAX_ERROR
+    assert report.stopped_by_validation
+    assert not executors.executed_anything()

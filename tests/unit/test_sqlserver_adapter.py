@@ -117,17 +117,25 @@ def test_query_timeout_is_set_on_the_cursor() -> None:
     executor.execute_scalar("SELECT 1", 45)
 
     assert driver.connection is not None
-    assert driver.connection.cursors[0].timeout == 45
+    assert driver.connection.timeout == 45
 
 
-def test_a_non_positive_timeout_is_rejected_before_connecting() -> None:
+def test_a_non_positive_timeout_means_no_limit() -> None:
+    """Zero is not an error: it is how ODBC spells "wait as long as it takes"."""
     driver = FakePyodbc()
     executor = SqlServerExecutor(settings(), driver=driver)
 
-    with pytest.raises(DatabaseExecutionError, match="Timeout must be greater than 0"):
-        executor.execute_scalar("SELECT 1", 0)
+    assert executor.execute_scalar("SELECT 1", 0) == 1
+    assert driver.connection.timeout == 0
 
-    assert driver.connections == []
+
+def test_a_negative_timeout_is_folded_to_no_limit() -> None:
+    driver = FakePyodbc()
+    executor = SqlServerExecutor(settings(), driver=driver)
+
+    assert executor.execute_scalar("SELECT 1", -5) == 1
+    # Never handed to the driver as a negative, which ODBC would reject.
+    assert driver.connection.timeouts_seen == [0]
 
 
 def test_more_than_one_row_is_rejected() -> None:
@@ -358,7 +366,7 @@ def test_validation_applies_the_query_timeout() -> None:
     SqlServerExecutor(settings(), driver=driver).validate_syntax("SELECT 1", 45)
 
     assert driver.connection is not None
-    assert [cursor.timeout for cursor in driver.connection.cursors] == [45]
+    assert driver.connection.timeouts_seen == [45]
 
 
 def test_validation_closes_its_cursor() -> None:
@@ -369,11 +377,13 @@ def test_validation_closes_its_cursor() -> None:
     assert all(cursor.closed for cursor in driver.connection.cursors)
 
 
-def test_validation_refuses_a_timeout_of_zero() -> None:
-    executor = SqlServerExecutor(settings(), driver=FakePyodbc())
+def test_validation_accepts_a_timeout_of_zero_as_no_limit() -> None:
+    driver = FakePyodbc()
+    executor = SqlServerExecutor(settings(), driver=driver)
 
-    with pytest.raises(DatabaseExecutionError, match="greater than 0"):
-        executor.validate_syntax("SELECT 1", 0)
+    executor.validate_syntax("SELECT 1", 0)
+
+    assert driver.connection.timeouts_seen == [0]
 
 
 def test_the_password_never_reaches_a_validation_failure() -> None:
@@ -386,3 +396,44 @@ def test_the_password_never_reaches_a_validation_failure() -> None:
         executor.validate_syntax("SELECT 1", 30)
 
     assert SECRET not in str(raised.value)
+
+
+def test_a_whole_run_validates_every_query_then_executes_them_on_one_session() -> None:
+    """The shape the validation gate actually uses: compile all, then run all.
+
+    ``SET NOEXEC ON`` is session state on a connection every test case shares,
+    so a leak would not fail loudly — every later query would succeed and
+    return nothing. This asserts the session is executing again by the time
+    the real queries run.
+    """
+    queries = [f"SELECT COUNT(*) FROM dbo.T{i}" for i in range(1, 4)]
+    connection = FakeConnection(values_by_sql=dict.fromkeys(queries, 7))
+    executor = SqlServerExecutor(settings(), driver=FakePyodbc(connection=connection))
+
+    for sql in queries:
+        executor.validate_syntax(sql, 30)
+    results = [executor.execute_scalar(sql, 30) for sql in queries]
+
+    assert results == [7, 7, 7], "every query must return its value after validation"
+    # NOEXEC was turned off after each check, never left on.
+    toggles = [s for s in connection.executed_sql if s.startswith("SET NOEXEC")]
+    assert toggles == ["SET NOEXEC ON", "SET NOEXEC OFF"] * 3
+    assert toggles[-1] == "SET NOEXEC OFF"
+
+
+def test_execution_still_works_when_one_query_fails_validation() -> None:
+    """A rejected query must not leave the session unable to run the others."""
+    good = "SELECT COUNT(*) FROM dbo.Good"
+    bad = "SELECT COUNT(*) FROM dbo.Paymnets"
+    connection = FakeConnection(
+        values_by_sql={good: 5, bad: odbc_error("42S02", "Invalid object name")}
+    )
+    executor = SqlServerExecutor(settings(), driver=FakePyodbc(connection=connection))
+
+    with pytest.raises(SqlSyntaxError):
+        executor.validate_syntax(bad, 30)
+
+    assert executor.execute_scalar(good, 30) == 5
+    assert [s for s in connection.executed_sql if s.startswith("SET NOEXEC")][-1] == (
+        "SET NOEXEC OFF"
+    )

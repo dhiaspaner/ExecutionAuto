@@ -31,7 +31,7 @@ quietly omitted, because a run with unexecuted tests is never a pass.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -58,10 +58,12 @@ from ..models import (
     ErrorCode,
     ExecutionScope,
     Platform,
+    RunMode,
     ScalarValue,
     TestStatus,
 )
 from ..security.redaction import sanitize_error, sanitize_text
+from ..workbook.columns import VALIDATION_ERRORS_SHEET
 from ..workbook.observations import ObservationRules, render_template
 from ..workbook.output import ResultWriter
 from ..workbook.run_control import RunControl
@@ -87,6 +89,33 @@ _PLATFORM_OF_SIDE: Mapping[str, Platform] = {
     "source": Platform.SOURCE,
     "target": Platform.TARGET,
 }
+
+
+#: Called with one already-sanitized progress line. The engine never formats a
+#: credential, a connection string or any SQL into these, so whatever a caller
+#: does with them — console, file, both — is safe.
+ProgressLog = Callable[[str], None]
+
+
+#: How much of a sanitized error to show on one progress line. The whole of it
+#: is written to the ``Validation Errors`` sheet, so the console stays scannable
+#: at two hundred rows instead of scrolling one failure off the top.
+_PROGRESS_DETAIL_CHARS = 110
+
+
+def _short(detail: str) -> str:
+    """One line's worth of an already-sanitized message."""
+    collapsed = " ".join(detail.split())
+    if len(collapsed) <= _PROGRESS_DETAIL_CHARS:
+        return collapsed
+    return f"{collapsed[:_PROGRESS_DETAIL_CHARS].rstrip()}..."
+
+
+def _progress(log: ProgressLog | None) -> ProgressLog:
+    """A reporter that does nothing when the caller asked for no logging."""
+    if log is None:
+        return lambda _message: None
+    return log
 
 
 def new_run_id() -> str:
@@ -169,6 +198,8 @@ class RunReport:
     stopped_by_validation: bool = False
     warnings: tuple[str, ...] = ()
     connections: tuple[str, ...] = ()
+    #: One ``Syntax Validation`` row per test the pre-execution check looked at.
+    validation_rows: tuple[dict[str, Any], ...] = ()
 
     def _count(self, *statuses: TestStatus) -> int:
         return sum(1 for outcome in self.outcomes if outcome.status in statuses)
@@ -229,6 +260,35 @@ class RunReport:
     def is_clean(self) -> bool:
         return self.overall_status == "PASS"
 
+    def validation_failures(self) -> tuple[TestOutcome, ...]:
+        """The outcomes pass 1 produced: queries the database would not compile.
+
+        Identified by error code rather than by status, because a rejected
+        query and a check that could not be performed are different statuses
+        but the same problem for whoever has to fix the sheet.
+        """
+        codes = {
+            ErrorCode.SYNTAX_ERROR.value,
+            ErrorCode.SYNTAX_CHECK_FAILED.value,
+        }
+        return tuple(outcome for outcome in self.outcomes if outcome.error_code in codes)
+
+    def validation_error_rows(self) -> tuple[dict[str, Any], ...]:
+        """One ``Validation Errors`` row per query that failed pass 1."""
+        return tuple(
+            {
+                "Run_ID": self.run_id,
+                "Checked_At_UTC": outcome.executed_at,
+                "Test_ID": outcome.test_id,
+                "Row": outcome.row_number,
+                "Status": outcome.status.value,
+                "Platform": outcome.platform.value,
+                "Error_Code": outcome.error_code,
+                "Error_Detail": outcome.error_detail,
+            }
+            for outcome in self.validation_failures()
+        )
+
     def history_row(self) -> dict[str, Any]:
         return {
             "Run_ID": self.run_id,
@@ -269,8 +329,14 @@ def execute_plan(
     started_at: datetime | None = None,
     output_dir: Path | None = None,
     write_output: bool = True,
+    on_progress: ProgressLog | None = None,
+    mode: RunMode = RunMode.EXECUTE,
 ) -> RunReport:
-    """Run a plan and return what happened. Always closes every connection."""
+    """Run a plan and return what happened. Always closes every connection.
+
+    ``on_progress`` receives one sanitized line per step, so a caller can show
+    the pre-execution check happening and see exactly where a run stopped.
+    """
     control = plan.control
     identifier = run_id or new_run_id()
     started = started_at or datetime.now(UTC).replace(microsecond=0)
@@ -291,6 +357,7 @@ def execute_plan(
 
     connections: tuple[str, ...] = ()
     gate_closed = False
+    validation_rows: tuple[dict[str, Any], ...] = ()
     try:
         if control.dry_run:
             reason = "Dry run: the test was validated but no SQL was executed."
@@ -310,9 +377,12 @@ def execute_plan(
             )
         else:
             connections = executors.sections
-            passes = _execute_tests(plan, executors, outcomes, control, identifier)
+            passes = _execute_tests(
+                plan, executors, outcomes, control, identifier, _progress(on_progress), mode
+            )
             warnings.extend(passes.warnings)
             gate_closed = passes.gate_closed
+            validation_rows = passes.validation_rows
     finally:
         if executors is not None:
             executors.close_all()
@@ -328,6 +398,7 @@ def execute_plan(
         stopped_by_validation=gate_closed,
         warnings=tuple(warnings),
         connections=connections,
+        validation_rows=validation_rows,
     )
 
     if control.dry_run or not write_output:
@@ -346,6 +417,7 @@ class _Passes:
 
     warnings: tuple[str, ...] = ()
     gate_closed: bool = False
+    validation_rows: tuple[dict[str, Any], ...] = ()
 
 
 def _execute_tests(
@@ -354,6 +426,8 @@ def _execute_tests(
     outcomes: _Outcomes,
     control: RunControl,
     run_id: str,
+    log: ProgressLog,
+    mode: RunMode = RunMode.EXECUTE,
 ) -> _Passes:
     """Validate every enabled test, then execute them only if all of them passed."""
     _identities, failures = executors.open_all()
@@ -380,18 +454,52 @@ def _execute_tests(
             )
         )
 
-    validation = _validate_tests(runnable, executors, plan.rules, control, run_id)
+    validation = _validate_tests(runnable, executors, plan.rules, control, run_id, log)
     for outcome in validation.failures:
         outcomes.add(outcome)
 
     if validation.failures:
         reason = _gate_reason(validation.failures)
+        log("")
+        log(
+            f"VALIDATION FAILED: {len(validation.failures)} of {len(runnable)} "
+            f"queries were rejected by the database."
+        )
+        for outcome in validation.failures:
+            log(
+                f"    row {outcome.row_number}  {outcome.test_id or '(no id)'}  "
+                f"[{outcome.error_code}] {_short(outcome.error_detail)}"
+            )
+        log("")
+        log(
+            f"  Nothing was executed. {len(validation.passed)} query(s) that did compile "
+            f"were left unrun."
+        )
+        log(
+            f"  The '{VALIDATION_ERRORS_SHEET}' sheet of the result workbook lists every one, "
+            f"with the database's full message."
+        )
         for definition in validation.passed:
             outcomes.add(_not_executed(definition, reason, plan.rules, control, run_id))
-        return _Passes(warnings=(*validation.warnings, reason), gate_closed=True)
+        return _Passes(
+            warnings=(*validation.warnings, reason),
+            gate_closed=True,
+            validation_rows=validation.rows,
+        )
 
-    _run_tests(validation.passed, executors, outcomes, plan, control, run_id)
-    return _Passes(warnings=validation.warnings)
+    log(f"  All {len(validation.passed)} queries compiled. Nothing was rejected.")
+    if mode is RunMode.VALIDATE:
+        log("")
+        log(
+            f"Validation run: stopping here by request. "
+            f"{len(validation.passed)} query(s) compiled and none were executed."
+        )
+        for definition in validation.passed:
+            outcomes.add(_validated_outcome(definition, plan.rules, control, run_id))
+        return _Passes(warnings=validation.warnings, validation_rows=validation.rows)
+
+    _run_tests(validation.passed, executors, outcomes, plan, control, run_id, log)
+    return _Passes(warnings=validation.warnings, validation_rows=validation.rows)
 
 
 # -- pass 1: validation ------------------------------------------------------
@@ -404,6 +512,8 @@ class _Validation:
     passed: tuple[TestDefinition, ...] = ()
     failures: tuple[TestOutcome, ...] = ()
     warnings: tuple[str, ...] = ()
+    #: One ``Syntax Validation`` row per test checked, in row order.
+    rows: tuple[dict[str, Any], ...] = ()
 
 
 def _validate_tests(
@@ -412,6 +522,7 @@ def _validate_tests(
     rules: ObservationRules,
     control: RunControl,
     run_id: str,
+    log: ProgressLog,
 ) -> _Validation:
     """Ask the databases to compile every query, and execute none of them.
 
@@ -425,16 +536,51 @@ def _validate_tests(
     warnings: list[str] = []
     unavailable: set[str] = set()
 
-    for definition in definitions:
+    total = len(definitions)
+    rows: list[dict[str, Any]] = []
+    log("")
+    log(f"Validation phase: compiling {total} query(s). No SQL is executed in this pass.")
+    for index, definition in enumerate(definitions, start=1):
+        unchecked: set[str] = set()
         failure = _validate_one(
-            definition, executors, rules, control, run_id, checked_at, unavailable, warnings
+            definition,
+            executors,
+            rules,
+            control,
+            run_id,
+            checked_at,
+            unavailable,
+            warnings,
+            unchecked,
         )
         if failure is None:
             passed.append(definition)
+            # "Not checked" is not "fine": the database could not be asked, so
+            # the row says so rather than implying the SQL was proven sound.
+            result = "NOT CHECKED" if unchecked else "OK"
+            log(f"  [{index:>4}/{total}] {definition.test_id}  {result.lower()}")
+            rows.append(
+                _validation_row(definition, run_id, checked_at, result, Platform.NONE, "", "")
+            )
         else:
             failures.append(failure)
+            log(
+                f"  [{index:>4}/{total}] {definition.test_id}  "
+                f"{failure.status.value}  [{failure.error_code}] {_short(failure.error_detail)}"
+            )
+            rows.append(
+                _validation_row(
+                    definition,
+                    run_id,
+                    checked_at,
+                    failure.status.value,
+                    failure.platform,
+                    failure.error_code,
+                    failure.error_detail,
+                )
+            )
 
-    return _Validation(tuple(passed), tuple(failures), tuple(warnings))
+    return _Validation(tuple(passed), tuple(failures), tuple(warnings), tuple(rows))
 
 
 def _validate_one(
@@ -446,6 +592,7 @@ def _validate_one(
     checked_at: datetime,
     unavailable: set[str],
     warnings: list[str],
+    unchecked: set[str],
 ) -> TestOutcome | None:
     """Check one test's queries. ``None`` means every side compiled.
 
@@ -460,6 +607,7 @@ def _validate_one(
         except SyntaxCheckUnavailableError as exc:
             # Nothing was proven about this SQL either way, so it is not a
             # failure — but the run says out loud that it is going in unchecked.
+            unchecked.add(definition.test_id)
             if section not in unavailable:
                 unavailable.add(section)
                 warnings.append(
@@ -515,6 +663,28 @@ def _validation_failure(
     )
 
 
+def _validation_row(
+    definition: TestDefinition,
+    run_id: str,
+    checked_at: datetime,
+    result: str,
+    platform: Platform,
+    error_code: str,
+    detail: str,
+) -> dict[str, Any]:
+    """One ``Syntax Validation`` row. Carries no SQL and no row data."""
+    return {
+        "Run_ID": run_id,
+        "Checked_At_UTC": checked_at,
+        "Test_ID": definition.test_id,
+        "Row": definition.row_number,
+        "Result": result,
+        "Platform": platform.value,
+        "Error_Code": error_code,
+        "Error_Detail": detail,
+    }
+
+
 def _gate_reason(failures: Sequence[TestOutcome]) -> str:
     """Why nothing ran, naming the rows that have to be fixed first."""
     named = ", ".join(
@@ -539,16 +709,24 @@ def _run_tests(
     plan: ExecutionPlan,
     control: RunControl,
     run_id: str,
+    log: ProgressLog,
 ) -> None:
     """Execute the tests pass 1 cleared, in row order."""
     stopped_reason = ""
-    for definition in definitions:
+    total = len(definitions)
+    log("")
+    log(f"Execution phase: running {total} test(s), one at a time.")
+    for index, definition in enumerate(definitions, start=1):
         if stopped_reason:
             outcomes.add(_not_executed(definition, stopped_reason, plan.rules, control, run_id))
             continue
 
         outcome = _execute_one(definition, executors, plan.rules, control, run_id)
         outcomes.add(outcome)
+        detail = (
+            f"  [{outcome.error_code}] {_short(outcome.error_detail)}" if outcome.error_code else ""
+        )
+        log(f"  [{index:>4}/{total}] {definition.test_id}  {outcome.status.value}{detail}")
         if not control.continue_on_test_error and outcome.status in {
             TestStatus.ERROR,
             TestStatus.BLOCKED,
@@ -556,6 +734,7 @@ def _run_tests(
             stopped_reason = (
                 f"Stopped after {definition.test_id} errored, because Continue_On_Test_Error = No."
             )
+            log(f"  {stopped_reason}")
 
 
 def _execute_one(
@@ -800,6 +979,22 @@ def _outcome(
     )
 
 
+def _validated_outcome(
+    definition: TestDefinition, rules: ObservationRules, control: RunControl, run_id: str
+) -> TestOutcome:
+    """A query that compiled in a validate-only run: an outcome, not a gap."""
+    return _outcome(
+        definition,
+        TestStatus.VALIDATED,
+        Platform.NONE,
+        None,
+        "Query compiled. Not executed: this was a validation run.",
+        rules,
+        control,
+        run_id,
+    )
+
+
 def _disabled_outcome(
     definition: TestDefinition, rules: ObservationRules, control: RunControl, run_id: str
 ) -> TestOutcome:
@@ -924,7 +1119,10 @@ def _write_results(plan: ExecutionPlan, report: RunReport, *, output_dir: Path |
             stopped_by_validation=report.stopped_by_validation,
             warnings=report.warnings,
             connections=report.connections,
+            validation_rows=report.validation_rows,
         )
+        writer.write_validation_report(final.validation_rows)
+        writer.write_validation_errors(final.validation_error_rows())
         writer.append_run_history(final.history_row())
         writer.save(destination)
     except WorkbookError as exc:

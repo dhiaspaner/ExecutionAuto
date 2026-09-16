@@ -49,6 +49,24 @@ def test_a_full_profile_parses() -> None:
     assert profile.target.trust_server_certificate is True
 
 
+def test_the_workbook_table_may_name_a_schema_file() -> None:
+    profile = parse_profile(
+        document(
+            workbook={
+                "path": "C:/data/payments.xlsx",
+                "sheet": "Payments",
+                "schema": "~/schemas/payments.toml",
+            }
+        )
+    )
+
+    assert profile.schema_path == Path("~/schemas/payments.toml").expanduser()
+
+
+def test_a_profile_without_a_schema_leaves_the_layout_undecided() -> None:
+    assert parse_profile(document()).schema_path is None
+
+
 def test_an_empty_profile_answers_nothing() -> None:
     profile = RunProfile.empty()
 

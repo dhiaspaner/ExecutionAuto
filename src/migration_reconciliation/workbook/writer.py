@@ -18,13 +18,14 @@ Excel recalculating anything.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 from ..errors import WorkbookError
 from ..models import (
@@ -33,6 +34,12 @@ from ..models import (
     FieldDefinition,
     FieldType,
     WorkbookSchema,
+)
+from .columns import (
+    VALIDATION_COLUMNS,
+    VALIDATION_ERRORS_COLUMNS,
+    VALIDATION_ERRORS_SHEET,
+    VALIDATION_SHEET,
 )
 
 __all__ = ["TIMESTAMP_FORMAT", "build_output_path", "write_results"]
@@ -73,8 +80,18 @@ def write_results(
     run_id: str,
     timestamp: datetime,
     output_dir: str | Path | None = None,
+    validation_errors: Sequence[Mapping[str, Any]] = (),
+    validation_rows: Sequence[Mapping[str, Any]] = (),
 ) -> Path:
-    """Write ``results`` into a fresh copy of the workbook and return its path."""
+    """Write ``results`` into a fresh copy of the workbook and return its path.
+
+    ``validation_rows`` adds a ``Syntax Validation`` sheet recording the
+    pre-execution check for every test, whether it compiled or not.
+    ``validation_errors`` adds a ``Validation Errors`` sheet holding just the
+    rejected ones. Both are rewritten each run, and the errors sheet is left
+    out entirely when nothing failed, so a clean run never shows stale
+    failures.
+    """
     source_path = Path(input_path).resolve()
     if not source_path.is_file():
         raise WorkbookError(f"Workbook not found: {source_path}")
@@ -110,6 +127,11 @@ def write_results(
         for result in results:
             _write_row(sheet, schema, column_map, result)
 
+        _write_sheet(workbook, VALIDATION_SHEET, VALIDATION_COLUMNS, validation_rows)
+        _write_sheet(
+            workbook, VALIDATION_ERRORS_SHEET, VALIDATION_ERRORS_COLUMNS, validation_errors
+        )
+
         if not schema.preserve_other_sheets:
             for name in list(workbook.sheetnames):
                 if name != schema.sheet_name:
@@ -123,6 +145,35 @@ def write_results(
         workbook.close()
 
     return output_path
+
+
+def _write_sheet(
+    workbook: Any,
+    name: str,
+    headers: Sequence[str],
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    """Replace one report sheet, or leave none behind when there is nothing to say."""
+    if name in workbook.sheetnames:
+        del workbook[name]
+    if not rows:
+        return
+
+    sheet = workbook.create_sheet(name)
+    for column, header in enumerate(headers, start=1):
+        sheet.cell(row=1, column=column, value=header)
+    for offset, values in enumerate(rows, start=2):
+        for column, header in enumerate(headers, start=1):
+            value = values.get(header)
+            cell = sheet.cell(row=offset, column=column)
+            cell.value = value.replace(tzinfo=None) if isinstance(value, datetime) else value
+            if isinstance(value, datetime):
+                cell.number_format = "yyyy-mm-dd hh:mm:ss"
+
+    widths = {"Test_ID": 18, "Error_Code": 24, "Error_Detail": 90, "Checked_At_UTC": 20}
+    for column, header in enumerate(headers, start=1):
+        sheet.column_dimensions[get_column_letter(column)].width = widths.get(header, 14)
+    sheet.freeze_panes = "A2"
 
 
 def _resolve_free_path(output_path: Path, run_id: str) -> Path:

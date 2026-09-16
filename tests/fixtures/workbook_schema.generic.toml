@@ -66,6 +66,15 @@ required = true
 read = true
 write = false
 
+[fields.execution_scope]
+header = "Execution Scope"
+type = "enum"
+allowed_values = ["SOURCE_TARGET", "SOURCE_ONLY", "TARGET_ONLY"]
+required = false
+default = "SOURCE_TARGET"
+read = true
+write = false
+
 [fields.source_connection]
 header = "Source Connection"
 type = "string"
@@ -97,7 +106,7 @@ write = false
 [fields.comparison_rule]
 header = "Comparison Rule"
 type = "enum"
-allowed_values = ["equal", "expected_zero", "numeric_tolerance"]
+allowed_values = ["equal", "expected_zero", "numeric_tolerance", "no_comparison"]
 required = false
 default = "equal"
 read = true
@@ -121,6 +130,13 @@ write = false
 
 [fields.expected_result]
 header = "Expected Result"
+type = "string"
+required = false
+read = true
+write = false
+
+[fields.test_name]
+header = "Test Name"
 type = "string"
 required = false
 read = true
@@ -161,7 +177,15 @@ write = true
 [fields.status]
 header = "Status"
 type = "enum"
-allowed_values = ["PASS", "FAIL", "ERROR", "SKIPPED"]
+allowed_values = [
+  "PASS",
+  "FAIL",
+  "PROFILED",
+  "VALIDATED",
+  "NOT EXECUTED",
+  "ERROR",
+  "SKIPPED",
+]
 required = true
 read = false
 write = true

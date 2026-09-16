@@ -40,6 +40,7 @@ SUPPORTED_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0"})
 #: Semantic fields the runner cannot work without when reading a workbook.
 MANDATORY_READ_FIELDS: tuple[str, ...] = (
     "test_case_id",
+    "execution_scope",
     "source_type",
     "source_connection",
     "target_connection",

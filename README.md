@@ -21,7 +21,7 @@ There are three ways to run it:
 | --- | --- |
 | `reconcile run` | **The reconciliation template.** A TOML profile holds the connections; the workbook's `Test Cases`, `Run Control` and `Observation Rules` sheets hold everything else. Start here. |
 | `reconcile execute` | The offline command. Schema-driven, with scripted results from a TOML file and no database at all. Use it to validate a workbook or rehearse a run. |
-| `run_reconciliation.py` | The original interactive runner. Asks fifteen questions, connects to a real source and target, and executes a fixed-column workbook. |
+| `run_reconciliation.py` | The original interactive runner. Asks fifteen questions, connects to a real source and target, and executes a workbook laid out either the way it documents or the way a `--schema` file declares. |
 
 > None of them accepts a password as an argument, reads a credential from a file
 > or an environment variable, or writes one anywhere. See [SECURITY.md](SECURITY.md).
@@ -523,7 +523,9 @@ both**:
   time, and will not move on until each answer is valid. It has **no** validation
   gate: each query is checked offline by the SQL guard and then executed
   immediately, so a query that will not compile is one `ERROR` row among results
-  that already ran.
+  that already ran. It reads the sheet through its own fixed layout, or through
+  a [workbook schema DSL](#3c-or-describe-the-sheet-with-a-schema) when one is
+  given.
 
 ```powershell
 uv run python run_reconciliation.py
@@ -569,7 +571,8 @@ not a schema file:
 
 Four more columns are used **if they exist** and defaulted if they do not:
 `Enabled` (default true), `Comparison Rule` (default `equal`), `Tolerance`
-(default 0) and `Timeout Seconds` (default 120). `Domain` and `Entity` are read
+(default 0) and `Timeout Seconds` (default 0, meaning no limit — a query runs
+until the database answers it). `Domain` and `Entity` are read
 for reporting. Any other column is left alone, and every other worksheet is
 preserved untouched.
 
@@ -648,6 +651,7 @@ version = "1.0"
 [workbook]
 path = "C:/migration/payments_domain_reconciliation_v2.xlsx"
 sheet = "Payments"
+schema = "config/workbook_schema.default.toml"   # optional; see 3c below
 
 [source]
 type = "oracle"                  # "oracle" or "sqlserver"
@@ -683,6 +687,54 @@ With `authentication = "windows"` on both sides, the run asks **nothing at all**
 > credential on disk. A profile pointing at a workbook or sheet that does not
 > exist falls back to asking rather than failing.
 
+### 3c. Or describe the sheet with a schema
+
+The layout above — headers on row 1, called `ID`, `Source SQL`, `Target SQL` — is
+what the runner assumes when you tell it nothing. A workbook that does not look
+like that is read through a **workbook schema DSL** instead: the same TOML files
+`reconcile execute` uses.
+
+```powershell
+uv run python run_reconciliation.py --schema .\config\workbook_schema.default.toml
+```
+
+or, so it travels with the rest of the answers:
+
+```toml
+[workbook]
+path = "C:/migration/payments_reconciliation_automation_toml_v1.xlsx"
+schema = "config/workbook_schema.default.toml"
+```
+
+`--schema` wins over the profile's `schema`. The schema decides the sheet, the
+header row, the first data row and every column's header text, type, default and
+allowed values — so a title banner above the headers, or columns called
+`Test_ID` and `Source_SQL`, needs a schema file, not a change to this script.
+Two details are worth knowing:
+
+* **The schema names the sheet**, so that question is not asked. A `sheet` in the
+  profile, or one you choose yourself when the profile's is not in the workbook,
+  still wins: you picked it from this workbook's own list.
+* **It is validated before the first question** — an unsupported
+  `schema_version` or a missing mandatory field costs you neither fifteen
+  answers nor a connection.
+
+Which layout is in force is printed above the first question:
+
+```text
+Migration reconciliation
+========================================================================
+  Required columns : Test_ID, Source_Profile_Section, Target_Profile_Section, Source_SQL, Target_SQL
+  Result columns   : Source_Result, Target_Result, Variance, Status, Observation, ...
+  ...
+  Schema           : config\workbook_schema.default.toml (profile 'payments-toml-v1')
+```
+
+Writing one is covered under
+[Create a schema for another Excel template](#create-a-schema-for-another-excel-template); `reconcile validate-template
+--schema <file> <workbook>` checks a schema against a workbook without opening a
+database, which is the cheapest way to get one right.
+
 ### 4. Read the pre-flight, then the results
 
 Both connections open first and describe themselves, then the sheet is read and
@@ -694,7 +746,7 @@ Connecting...
   SOURCE  oracle at legacy-ora.corp.local:1521 db=LEGACYPAY user=recon_reader version=19.3.0.0.0
   TARGET  sqlserver at sql-mig-01.corp.local:1433 db=PaymentsMigrated user=svc_recon version=16.00.4125
 
-Sheet 'Payments':
+Sheet 'Payments' (headers on row 1):
   enabled cases  : 3
   disabled cases : 0
   invalid rows   : 0
@@ -714,17 +766,18 @@ Run 11e39e7daf1b - payments_demo.xlsx
 
 ### Repeat runs
 
-Four optional flags exist, because they change *what runs* rather than supply
-information the script needs:
+Five optional flags exist, because they change *what runs*, or how the sheet is
+read, rather than supply information the script needs:
 
 ```powershell
 uv run python run_reconciliation.py --case TC-PAY-008
 uv run python run_reconciliation.py --limit 2
 uv run python run_reconciliation.py --output-dir .\out
 uv run python run_reconciliation.py --profile .\config\my_profile.toml --limit 2
+uv run python run_reconciliation.py --schema .\config\workbook_schema.default.toml
 ```
 
-Those four are the only flags. There is deliberately no `--source-server`, no
+Those five are the only flags. There is deliberately no `--source-server`, no
 `--sheet-name` and no `--password`: connection details are typed in or come from
 a profile, and a password is only ever typed at a hidden prompt.
 

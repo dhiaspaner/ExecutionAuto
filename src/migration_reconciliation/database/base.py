@@ -15,7 +15,30 @@ from typing import Protocol, runtime_checkable
 from ..errors import NonScalarResultError
 from ..models import ConnectionIdentity, DatabaseType, ScalarValue
 
-__all__ = ["ExecutorFactory", "QueryExecutor", "QuerySide", "single_scalar"]
+__all__ = [
+    "NO_TIMEOUT",
+    "ExecutorFactory",
+    "QueryExecutor",
+    "QuerySide",
+    "normalize_timeout",
+    "single_scalar",
+]
+
+#: The value that means "wait as long as the query takes". Both drivers spell
+#: an unlimited wait as zero: pyodbc's ``cursor.timeout`` and ODBC's
+#: ``Connection Timeout``, and python-oracledb's ``call_timeout`` and
+#: ``tcp_connect_timeout``.
+NO_TIMEOUT = 0
+
+
+def normalize_timeout(timeout_seconds: int) -> int:
+    """Fold any non-positive timeout to :data:`NO_TIMEOUT`.
+
+    A missing, zero or negative timeout all mean the same thing — do not
+    impose a limit — so they are answered identically rather than one of them
+    becoming a driver error at the moment a long reconciliation finally runs.
+    """
+    return timeout_seconds if timeout_seconds > 0 else NO_TIMEOUT
 
 
 class QuerySide(StrEnum):
@@ -57,8 +80,9 @@ class QueryExecutor(Protocol):
         """Run ``sql`` and return its single scalar value.
 
         Implementations must pass ``sql`` to the driver verbatim — never
-        translated between dialects — apply ``timeout_seconds``, and reject any
-        result that is not exactly one row and one column.
+        translated between dialects — apply ``timeout_seconds`` (where a
+        non-positive value means no limit, see :func:`normalize_timeout`), and
+        reject any result that is not exactly one row and one column.
         """
         ...
 

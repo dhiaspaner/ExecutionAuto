@@ -47,12 +47,63 @@ class DatabaseType(StrEnum):
     SQLSERVER = "sqlserver"
 
 
+#: Error code for SQL the database refused to compile. Lives here because both
+#: the runner that writes it and the summary that counts it need the same
+#: spelling.
+SQL_SYNTAX_ERROR_CODE = "SQL_SYNTAX_ERROR"
+
+
+class OnSyntaxError(StrEnum):
+    """What a run does when a query will not compile.
+
+    ``CONTINUE`` records that test as ``ERROR`` and runs every test whose SQL
+    was sound, so one broken row costs one result rather than all of them.
+    ``STOP`` executes nothing at all, for when a partial reconciliation would
+    be worse than none.
+    """
+
+    CONTINUE = "continue"
+    STOP = "stop"
+
+
+class RunMode(StrEnum):
+    """What a run is being asked to do.
+
+    ``VALIDATE`` connects and asks the database to compile every query, then
+    stops: it is the pre-execution check on its own, for confirming a workbook
+    is sound without touching a reconciliation. ``EXECUTE`` does that same
+    check first and, only if it passes, goes on to run the queries.
+    """
+
+    VALIDATE = "validate"
+    EXECUTE = "execute"
+
+
+class ExecutionScope(StrEnum):
+    """Which database sides one test needs. Nothing else is ever opened."""
+
+    SOURCE_TARGET = "SOURCE_TARGET"
+    SOURCE_ONLY = "SOURCE_ONLY"
+    TARGET_ONLY = "TARGET_ONLY"
+
+    @property
+    def uses_source(self) -> bool:
+        return self is not ExecutionScope.TARGET_ONLY
+
+    @property
+    def uses_target(self) -> bool:
+        return self is not ExecutionScope.SOURCE_ONLY
+
+
 class ComparisonRule(StrEnum):
     """Strategies for deciding whether a source/target pair reconciles."""
 
     EQUAL = "equal"
     EXPECTED_ZERO = "expected_zero"
     NUMERIC_TOLERANCE = "numeric_tolerance"
+    #: Record both sides and render no verdict. Never reported as a pass:
+    #: nothing was compared, so there is nothing to have passed.
+    NO_COMPARISON = "no_comparison"
 
 
 class ExecutionStatus(StrEnum):
@@ -60,6 +111,15 @@ class ExecutionStatus(StrEnum):
 
     PASS = "PASS"
     FAIL = "FAIL"
+    #: A value was recorded but not verified, because the test asked for no
+    #: comparison. Distinct from SKIPPED, which means nothing ran at all.
+    PROFILED = "PROFILED"
+    #: The query compiled and was deliberately not executed, because the run
+    #: was asked to validate only. A successful outcome, not a failure.
+    VALIDATED = "VALIDATED"
+    #: This query compiled, but another one did not, so the run stopped before
+    #: executing anything. Distinct from SKIPPED (disabled in the workbook).
+    NOT_EXECUTED = "NOT EXECUTED"
     ERROR = "ERROR"
     SKIPPED = "SKIPPED"
 
@@ -168,9 +228,12 @@ class TestCase:
     target_connection: str
     source_sql: str
     target_sql: str
+    #: Which sides this test needs. Nothing else is ever opened or queried.
+    execution_scope: ExecutionScope = ExecutionScope.SOURCE_TARGET
     comparison_rule: ComparisonRule = ComparisonRule.EQUAL
     tolerance: Decimal = Decimal(0)
-    timeout_seconds: int = 120
+    #: ``0`` means no limit. See ``database.base.normalize_timeout``.
+    timeout_seconds: int = 0
     enabled: bool = True
     #: Optional semantic fields (domain, entity, severity, ...) kept verbatim so
     #: new template columns need no Python change.
@@ -226,8 +289,34 @@ class RunSummary:
         return self._count(ExecutionStatus.SKIPPED)
 
     @property
+    def validated(self) -> int:
+        """Queries that compiled in a validate-only run."""
+        return self._count(ExecutionStatus.VALIDATED)
+
+    @property
+    def syntax_errors(self) -> int:
+        """Queries the database refused to compile.
+
+        Counted by error code rather than status: these are reported as
+        ``ERROR`` like any other failure, because that is what they are — a
+        test that produced no result. The code is what says the fault was in
+        the SQL rather than in the data.
+        """
+        return sum(1 for r in self.results if r.error_code == SQL_SYNTAX_ERROR_CODE)
+
+    @property
+    def not_executed(self) -> int:
+        """Queries that compiled but never ran, because another one did not."""
+        return self._count(ExecutionStatus.NOT_EXECUTED)
+
+    @property
+    def stopped_by_validation(self) -> bool:
+        """True when the pre-execution check stopped the run before executing."""
+        return self.not_executed > 0
+
+    @property
     def executed(self) -> int:
-        return len(self.results) - self.skipped
+        return len(self.results) - self.skipped - self.not_executed - self.validated
 
     @property
     def duration_ms(self) -> int:
@@ -235,8 +324,12 @@ class RunSummary:
 
     @property
     def is_clean(self) -> bool:
-        """True when nothing failed and nothing errored."""
-        return self.failed == 0 and self.errored == 0
+        """True when nothing failed, errored, or was refused before execution.
+
+        A run stopped by the pre-execution check is never clean: no query was
+        executed, so there is no evidence that anything reconciles.
+        """
+        return self.failed == 0 and self.errored == 0 and self.not_executed == 0
 
 
 # ---------------------------------------------------------------------------
@@ -248,22 +341,6 @@ class RunSummary:
 # `ComparisonRule` / `ExecutionStatus` pipeline keeps working unchanged while
 # the two templates coexist.
 # ---------------------------------------------------------------------------
-
-
-class ExecutionScope(StrEnum):
-    """Which database sides one test needs. Nothing else is ever opened."""
-
-    SOURCE_TARGET = "SOURCE_TARGET"
-    SOURCE_ONLY = "SOURCE_ONLY"
-    TARGET_ONLY = "TARGET_ONLY"
-
-    @property
-    def uses_source(self) -> bool:
-        return self is not ExecutionScope.TARGET_ONLY
-
-    @property
-    def uses_target(self) -> bool:
-        return self is not ExecutionScope.SOURCE_ONLY
 
 
 class ComparisonType(StrEnum):
@@ -313,6 +390,8 @@ class TestStatus(StrEnum):
     PASS = "PASS"
     FAIL = "FAIL"
     PROFILED = "PROFILED"
+    #: Compiled and deliberately not executed, in a validate-only run.
+    VALIDATED = "VALIDATED"
     ERROR = "ERROR"
     SYNTAX_ERROR = "SYNTAX ERROR"
     BLOCKED = "BLOCKED"

@@ -1,23 +1,21 @@
 version = "1.0"
 
 [workbook]
-path = "C:/Users/QPros/Downloads/payments_reconciliation_automation_toml_v1.xlsx"
+path = "c:/Users/PC/Downloads/payments_reconciliation_automation_toml_v1.xlsx"
 sheet = "Test Cases"
 
 [source]
-type = "oracle"
-server = "10.230.1.196"
-port = 1521
-database = "mohredr"
-authentication = "password"
-username = "younes_qpro"
-oracle_client_mode = "thick"
-oracle_client_dir = "C:/oracle/instantclient_23_26"
+type = "sqlserver"
+server = "localhost"
+port = 1433
+authentication = "windows"
+trust_server_certificate = true
+database = "webservice"
+
 
 [target]
-type = "sqlserver"
-server = "sql-mig-01.corp.local"
+server = "localhost"
 port = 1433
-database = "PaymentsMigrated"
+database = "PaymentRecon_Target_Local"
 trust_server_certificate = true
 authentication = "windows"

@@ -12,10 +12,17 @@ password: connection details are typed in, used for the life of the run, and
 never stored. Passwords are read with :func:`getpass.getpass`, never echoed,
 never logged, and never written to the result workbook.
 
-Three optional flags exist, all of them execution modifiers rather than
+The sheet is read through a workbook schema DSL when one is given, and through
+the runner's own fixed layout when none is. Which one is in force is printed
+before the first question.
+
+These optional flags exist, all of them execution modifiers rather than
 information the script needs to run:
 
+``--mode MODE``      ``validate`` to compile every query and stop, or ``execute``
+``--on-syntax-error`` ``continue`` (record it as ERROR and run the rest) or ``stop``
 ``--profile FILE``   a TOML file that pre-answers the questions (never a password)
+``--schema FILE``    the workbook schema DSL to read the sheet with
 ``--case ID``        run only this test case; repeatable
 ``--limit N``        run at most N cases, for a pilot
 ``--output-dir DIR`` where to put the result workbook
@@ -29,12 +36,13 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from migration_reconciliation.database.base import QuerySide
 from migration_reconciliation.database.live import LiveExecutorFactory
 from migration_reconciliation.errors import ReconciliationError
-from migration_reconciliation.models import WorkbookSchema
+from migration_reconciliation.models import OnSyntaxError, RunMode, WorkbookSchema
 from migration_reconciliation.profile import RunProfile, load_profile
 from migration_reconciliation.reporting import (
     make_output_encoding_safe,
@@ -45,12 +53,12 @@ from migration_reconciliation.runner import ReconciliationRunner, RunOptions
 from migration_reconciliation.security.redaction import sanitize_error
 from migration_reconciliation.wizard import WizardAnswers, run_wizard
 from migration_reconciliation.workbook.inline import (
-    OPTIONAL_INPUT_HEADERS,
     REQUIRED_INPUT_HEADERS,
     RESULT_HEADERS,
     build_inline_schema,
 )
 from migration_reconciliation.workbook.reader import validate_workbook
+from migration_reconciliation.workbook.schema import load_schema
 
 PROGRAM = "run_reconciliation.py"
 
@@ -76,6 +84,37 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "TOML file answering any of the connection questions. It never contains a "
             "password: one is still prompted for, unless Windows authentication is used."
+        ),
+    )
+    parser.add_argument(
+        "--schema",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Workbook schema DSL (.toml) binding semantic fields to this template's "
+            "sheet, header row and header text. Overrides [workbook] schema in the "
+            "profile. Without either, the runner's own fixed layout is assumed."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=[mode.value for mode in RunMode],
+        default=RunMode.EXECUTE.value,
+        help=(
+            "'validate' connects and asks the database to compile every query, writes the "
+            "validation sheets and stops without executing anything. 'execute' (the default) "
+            "runs that same check first and only executes when every query compiled."
+        ),
+    )
+    parser.add_argument(
+        "--on-syntax-error",
+        choices=[policy.value for policy in OnSyntaxError],
+        default=OnSyntaxError.CONTINUE.value,
+        help=(
+            "What to do about a query the database will not compile. 'continue' (the "
+            "default) records that test as ERROR and still runs every test whose SQL was "
+            "sound. 'stop' executes nothing at all, for when a partial reconciliation "
+            "would be worse than none."
         ),
     )
     parser.add_argument(
@@ -116,13 +155,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _run(args: argparse.Namespace) -> int:
-    _banner()
     profile = RunProfile.empty()
     if args.profile is not None:
         profile = load_profile(args.profile)
+    schema_path = args.schema if args.schema is not None else profile.schema_path
+    # Validated before the first question: a schema typo should cost neither
+    # fifteen answers nor a connection.
+    declared = load_schema(schema_path) if schema_path is not None else None
+
+    _banner(declared)
+    if args.profile is not None:
         _emit(f"  Profile          : {args.profile}")
+    if declared is not None:
+        _emit(f"  Schema           : {schema_path} (profile '{declared.profile_name}')")
+        if profile.sheet_name is None:
+            # The schema names the sheet, so there is no question to ask.
+            profile = replace(profile, sheet_name=declared.sheet_name)
+
     answers = run_wizard(profile=profile)
-    schema = build_inline_schema(answers.sheet_name, answers.source.database_type)
+    schema = _schema_for(declared, answers)
 
     factory = LiveExecutorFactory(answers.source, answers.target)
     try:
@@ -137,15 +188,17 @@ def _run(args: argparse.Namespace) -> int:
             _error("No enabled test cases to run.")
             return EXIT_USAGE
 
-        _emit("")
-        _emit("Executing...")
         options = RunOptions(
             case_ids=tuple(args.cases),
             limit=args.limit,
             output_dir=args.output_dir,
             write_output=True,
+            mode=RunMode(args.mode),
+            on_syntax_error=OnSyntaxError(args.on_syntax_error),
         )
-        summary = ReconciliationRunner(schema, factory).run(answers.workbook_path, options)
+        summary = ReconciliationRunner(schema, factory).run(
+            answers.workbook_path, options, on_progress=_emit
+        )
     finally:
         factory.close_all()
 
@@ -155,17 +208,42 @@ def _run(args: argparse.Namespace) -> int:
     return EXIT_OK if summary.is_clean else EXIT_FAILURES
 
 
+def _schema_for(declared: WorkbookSchema | None, answers: WizardAnswers) -> WorkbookSchema:
+    """The schema this run reads with: the DSL when one was given, else the fixed layout.
+
+    The answered sheet wins over the one the DSL declares. The person picked it
+    from this workbook's own list of sheets, so it is the more specific answer;
+    everything else — header row, first data row, header text, types, defaults —
+    stays exactly as the schema file declares it.
+    """
+    if declared is None:
+        return build_inline_schema(answers.sheet_name, answers.source.database_type)
+    if declared.sheet_name == answers.sheet_name:
+        return declared
+    return replace(declared, sheet_name=answers.sheet_name)
+
+
+def _required_headers(schema: WorkbookSchema) -> list[str]:
+    """Headers the sheet must carry for the run to read it at all."""
+    return [field.header for field in schema.readable_fields() if field.required]
+
+
+def _result_headers(schema: WorkbookSchema) -> list[str]:
+    """Headers the run writes its outcome to."""
+    return [field.header for field in schema.writable_fields()]
+
+
 def _preflight(answers: WizardAnswers, schema: WorkbookSchema) -> int:
     """Read the sheet and report what was found, before any query runs.
 
-    Reading is cheap and catches a mistyped sheet, a missing ``Source SQL``
-    column or a duplicate id while the person is still watching — rather than
-    after two hundred queries have already gone to the database.
+    Reading is cheap and catches a mistyped sheet, a missing required column or
+    a duplicate id while the person is still watching — rather than after two
+    hundred queries have already gone to the database.
     """
     read = validate_workbook(answers.workbook_path, schema)
 
     _emit("")
-    _emit(f"Sheet '{answers.sheet_name}':")
+    _emit(f"Sheet '{schema.sheet_name}' (headers on row {schema.header_row}):")
     _emit(f"  enabled cases  : {len(read.test_cases)}")
     _emit(f"  disabled cases : {len(read.skipped)}")
     _emit(f"  invalid rows   : {len(read.invalid)}")
@@ -173,27 +251,33 @@ def _preflight(answers: WizardAnswers, schema: WorkbookSchema) -> int:
         _emit(f"    row {invalid.row_number} [{invalid.test_case_id or '?'}]: {invalid.message}")
 
     found_optional = [
-        header for name, header in OPTIONAL_INPUT_HEADERS.items() if name in read.column_map
+        field.header
+        for field in schema.readable_fields()
+        if not field.required and field.name in read.column_map
     ]
     if found_optional:
         _emit(f"  optional columns used: {', '.join(found_optional)}")
 
-    missing_results = [
-        header for name, header in RESULT_HEADERS.items() if name not in read.column_map
-    ]
-    if len(missing_results) == len(RESULT_HEADERS):
+    result_fields = schema.writable_fields()
+    missing_results = [field.header for field in result_fields if field.name not in read.column_map]
+    if result_fields and len(missing_results) == len(result_fields):
         raise ReconciliationError(
-            f"Sheet '{answers.sheet_name}' has none of the result columns "
-            f"({', '.join(RESULT_HEADERS.values())}), so there is nowhere to write the outcome."
+            f"Sheet '{schema.sheet_name}' has none of the result columns "
+            f"({', '.join(_result_headers(schema))}), so there is nowhere to write the outcome."
         )
     if missing_results:
         _emit(f"  result columns missing (will not be written): {', '.join(missing_results)}")
     return len(read.test_cases)
 
 
-def _banner() -> None:
-    required = ", ".join(REQUIRED_INPUT_HEADERS.values())
-    results = ", ".join(RESULT_HEADERS.values())
+def _banner(schema: WorkbookSchema | None) -> None:
+    """Name the columns this run needs, from the schema when there is one."""
+    if schema is None:
+        required = ", ".join(REQUIRED_INPUT_HEADERS.values())
+        results = ", ".join(RESULT_HEADERS.values())
+    else:
+        required = ", ".join(_required_headers(schema)) or "none declared"
+        results = ", ".join(_result_headers(schema)) or "none declared"
     _emit("Migration reconciliation")
     _emit("=" * 72)
     _emit(f"  Required columns : {required}")

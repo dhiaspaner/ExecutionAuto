@@ -91,14 +91,26 @@ def test_call_timeout_is_set_in_milliseconds_and_then_restored() -> None:
     assert connection.call_timeout == 0
 
 
-def test_a_non_positive_timeout_is_rejected_before_connecting() -> None:
-    driver = FakeOracleDb()
+def test_a_non_positive_timeout_means_no_limit() -> None:
+    """Zero is how python-oracledb spells "no call timeout", not an error."""
+    connection = FakeConnection(call_timeout=0)
+    driver = FakeOracleDb(connection=connection)
     executor = OracleExecutor(settings(), driver=driver)
 
-    with pytest.raises(DatabaseExecutionError, match="Timeout must be greater than 0"):
-        executor.execute_scalar("SELECT 1 FROM dual", 0)
+    assert executor.execute_scalar("SELECT 1 FROM dual", 0) == 1
+    # Set and restore both recorded; neither ever imposes a limit.
+    assert set(connection.call_timeouts_seen) == {0}
 
-    assert driver.connections == []
+
+def test_a_negative_timeout_is_folded_to_no_limit() -> None:
+    connection = FakeConnection(call_timeout=0)
+    driver = FakeOracleDb(connection=connection)
+    executor = OracleExecutor(settings(), driver=driver)
+
+    assert executor.execute_scalar("SELECT 1 FROM dual", -5) == 1
+    # Never handed to the driver as a negative millisecond count.
+    # Set and restore both recorded; neither ever imposes a limit.
+    assert set(connection.call_timeouts_seen) == {0}
 
 
 def test_more_than_one_row_is_rejected() -> None:
@@ -415,11 +427,14 @@ def test_validation_closes_its_cursor() -> None:
     assert all(cursor.closed for cursor in connection.cursors)
 
 
-def test_validation_refuses_a_timeout_of_zero() -> None:
-    executor = OracleExecutor(settings(), driver=FakeOracleDb())
+def test_validation_accepts_a_timeout_of_zero_as_no_limit() -> None:
+    connection = FakeConnection(call_timeout=0)
+    executor = OracleExecutor(settings(), driver=FakeOracleDb(connection=connection))
 
-    with pytest.raises(DatabaseExecutionError, match="greater than 0"):
-        executor.validate_syntax("SELECT 1 FROM DUAL", 0)
+    executor.validate_syntax("SELECT 1 FROM DUAL", 0)
+
+    # Set and restore both recorded; neither ever imposes a limit.
+    assert set(connection.call_timeouts_seen) == {0}
 
 
 def test_a_driver_without_a_parse_call_reports_an_unavailable_check() -> None:

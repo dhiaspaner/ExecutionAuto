@@ -63,7 +63,8 @@ class RunControl:
     """Validated run-control settings. Defaults are the safe answers."""
 
     template_version: str = ""
-    query_timeout_seconds: int = 120
+    #: ``0`` means no limit: a query runs until the database answers.
+    query_timeout_seconds: int = 0
     max_parallel_workers: int = 1
     continue_on_test_error: bool = True
     stop_on_critical_config_error: bool = True
@@ -192,7 +193,7 @@ def _build(raw: dict[str, Any]) -> RunControl:
 
     return RunControl(
         template_version=template_version,
-        query_timeout_seconds=_integer(raw, "Query_Timeout_Seconds", 120, minimum=1, maximum=3600),
+        query_timeout_seconds=_integer(raw, "Query_Timeout_Seconds", 0, minimum=0, maximum=3600),
         max_parallel_workers=workers,
         continue_on_test_error=_boolean(raw, "Continue_On_Test_Error", True),
         stop_on_critical_config_error=_boolean(raw, "Stop_On_Critical_Config_Error", True),

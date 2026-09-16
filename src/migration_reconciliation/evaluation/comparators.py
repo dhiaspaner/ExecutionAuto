@@ -23,7 +23,7 @@ from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 from ..errors import ComparisonError
-from ..models import ComparisonRule, ScalarValue
+from ..models import ComparisonRule, ExecutionScope, ScalarValue
 
 __all__ = [
     "Comparator",
@@ -55,6 +55,10 @@ class ComparisonOutcome:
     passed: bool
     variance: Decimal | None
     remarks: str
+    #: True when no verdict was rendered because none was asked for. The
+    #: values are recorded; ``passed`` is meaningless and must not be read
+    #: as a success.
+    profiled: bool = False
 
 
 @runtime_checkable
@@ -64,7 +68,11 @@ class Comparator(Protocol):
     rule: ComparisonRule
 
     def compare(
-        self, source: ScalarValue, target: ScalarValue, tolerance: Decimal
+        self,
+        source: ScalarValue,
+        target: ScalarValue,
+        tolerance: Decimal,
+        scope: ExecutionScope = ExecutionScope.SOURCE_TARGET,
     ) -> ComparisonOutcome: ...
 
 
@@ -148,14 +156,33 @@ def _require_comparable(
     return source_kind, source_value, target_value
 
 
+def _require_both_sides(rule: ComparisonRule, scope: ExecutionScope) -> None:
+    """Refuse a two-sided rule on a test that only runs one side.
+
+    Comparing against a side that was never queried would read ``None`` as a
+    value, so this is reported as a configuration error rather than silently
+    becoming a pass or a failure.
+    """
+    if scope is not ExecutionScope.SOURCE_TARGET:
+        raise ComparisonError(
+            f"comparison rule '{rule.value}' compares both sides and cannot be used "
+            f"with Execution_Scope {scope.value}"
+        )
+
+
 class EqualComparator:
     """Pass when the normalized source and target values are equal."""
 
     rule = ComparisonRule.EQUAL
 
     def compare(
-        self, source: ScalarValue, target: ScalarValue, tolerance: Decimal
+        self,
+        source: ScalarValue,
+        target: ScalarValue,
+        tolerance: Decimal,
+        scope: ExecutionScope = ExecutionScope.SOURCE_TARGET,
     ) -> ComparisonOutcome:
+        _require_both_sides(self.rule, scope)
         kind, source_value, target_value = _require_comparable(source, target)
         passed = source_value == target_value
         if passed:
@@ -171,31 +198,38 @@ class ExpectedZeroComparator:
     """Pass when **both** the source and target results are numeric zero.
 
     ``expected_zero`` is for mismatch/orphan-count queries, where each side
-    independently answers "how many rows are wrong?". Both sides are executed
-    and both must answer zero. Requiring both — rather than picking one side —
-    means a non-zero count can never be discarded unread. If only one side is
-    meaningful for a given check, put the same query in both columns.
+    independently answers "how many rows are wrong?". Every side the test's
+    scope names is checked, and every one of them must answer zero, so a
+    non-zero count can never be discarded unread. A one-sided test checks only
+    the side it ran: there is no second query whose absence could mask a count.
     """
 
     rule = ComparisonRule.EXPECTED_ZERO
 
     def compare(
-        self, source: ScalarValue, target: ScalarValue, tolerance: Decimal
+        self,
+        source: ScalarValue,
+        target: ScalarValue,
+        tolerance: Decimal,
+        scope: ExecutionScope = ExecutionScope.SOURCE_TARGET,
     ) -> ComparisonOutcome:
-        source_value = to_decimal(source, label="Source")
-        target_value = to_decimal(target, label="Target")
-        source_zero = source_value == 0
-        target_zero = target_value == 0
-        variance = source_value - target_value
-        if source_zero and target_zero:
-            return ComparisonOutcome(True, variance, "Source and target mismatch counts are 0.")
-        offenders = []
-        if not source_zero:
-            offenders.append(f"source {_display(source_value)}")
-        if not target_zero:
-            offenders.append(f"target {_display(target_value)}")
+        checked: list[tuple[str, Decimal]] = []
+        if scope.uses_source:
+            checked.append(("source", to_decimal(source, label="Source")))
+        if scope.uses_target:
+            checked.append(("target", to_decimal(target, label="Target")))
+
+        offenders = [f"{label} {_display(value)}" for label, value in checked if value != 0]
+        variance = (
+            checked[0][1] - checked[1][1]
+            if len(checked) == 2
+            else (checked[0][1] if checked else None)
+        )
+        if not offenders:
+            sides = " and ".join(label for label, _ in checked)
+            return ComparisonOutcome(True, variance, f"Mismatch count is 0 on {sides}.")
         return ComparisonOutcome(
-            False, variance, f"Expected 0 on both sides but found {' and '.join(offenders)}."
+            False, variance, f"Expected 0 but found {' and '.join(offenders)}."
         )
 
 
@@ -205,8 +239,13 @@ class NumericToleranceComparator:
     rule = ComparisonRule.NUMERIC_TOLERANCE
 
     def compare(
-        self, source: ScalarValue, target: ScalarValue, tolerance: Decimal
+        self,
+        source: ScalarValue,
+        target: ScalarValue,
+        tolerance: Decimal,
+        scope: ExecutionScope = ExecutionScope.SOURCE_TARGET,
     ) -> ComparisonOutcome:
+        _require_both_sides(self.rule, scope)
         if tolerance < 0:
             raise ComparisonError(f"tolerance must not be negative (got {_display(tolerance)})")
         source_value = to_decimal(source, label="Source")
@@ -226,12 +265,45 @@ class NumericToleranceComparator:
         )
 
 
+class NoComparisonComparator:
+    """Record both sides and render no verdict.
+
+    For rows that exist to capture a number, not to assert one: there is
+    nothing to compare against, so there is nothing that could pass. The
+    result is reported as ``PROFILED`` rather than ``PASS`` so an unverified
+    value can never be read as a green test.
+    """
+
+    rule = ComparisonRule.NO_COMPARISON
+
+    def compare(
+        self,
+        source: ScalarValue,
+        target: ScalarValue,
+        tolerance: Decimal,
+        scope: ExecutionScope = ExecutionScope.SOURCE_TARGET,
+    ) -> ComparisonOutcome:
+        recorded = [
+            f"{label} {_display(value)}"
+            for label, value in (("source", source), ("target", target))
+            if value is not None
+        ]
+        detail = ", ".join(recorded) if recorded else "no value returned"
+        return ComparisonOutcome(
+            False,
+            None,
+            f"Recorded without comparison: {detail}.",
+            profiled=True,
+        )
+
+
 _REGISTRY: dict[ComparisonRule, Comparator] = {
     comparator.rule: comparator
     for comparator in (
         EqualComparator(),
         ExpectedZeroComparator(),
         NumericToleranceComparator(),
+        NoComparisonComparator(),
     )
 }
 
@@ -249,9 +321,10 @@ def compare(
     source: ScalarValue,
     target: ScalarValue,
     tolerance: Decimal = Decimal(0),
+    scope: ExecutionScope = ExecutionScope.SOURCE_TARGET,
 ) -> ComparisonOutcome:
-    """Apply ``rule`` to one source/target pair."""
-    return get_comparator(rule).compare(source, target, tolerance)
+    """Apply ``rule`` to one source/target pair, for the sides ``scope`` names."""
+    return get_comparator(rule).compare(source, target, tolerance, scope)
 
 
 def _display(value: object) -> str:

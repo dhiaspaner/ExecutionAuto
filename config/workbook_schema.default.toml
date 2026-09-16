@@ -8,6 +8,10 @@
 #
 # Known gaps versus this template, left for a human decision rather than
 # guessed silently:
+#   - Execution_Scope is mapped, so one-sided tests work: a TARGET_ONLY row
+#     is not asked for Source_Profile_Section or Source_SQL and must leave
+#     them empty. Comparison_Type NO_COMPARISON records both results and
+#     renders no verdict, reported as PROFILED rather than PASS.
 #   - The template has both Absolute_Tolerance and Percentage_Tolerance, but
 #     the framework's `tolerance` field is a single number used only by the
 #     numeric_tolerance rule (abs(source - target) <= tolerance). This schema
@@ -66,6 +70,12 @@ type = "string"
 required = false
 read = true
 
+[fields.test_name]
+header = "Test_Name"
+type = "string"
+required = false
+read = true
+
 [fields.severity]
 header = "Severity"
 type = "string"
@@ -89,16 +99,28 @@ required = false
 default = "sqlserver"
 read = true
 
+# The template's Execution_Scope column. It decides which sides a row needs,
+# and therefore which of the four side-specific columns below are required:
+# a TARGET_ONLY row is not asked for a source connection or source SQL, and
+# must leave both empty.
+[fields.execution_scope]
+header = "Execution_Scope"
+type = "enum"
+allowed_values = ["SOURCE_TARGET", "SOURCE_ONLY", "TARGET_ONLY"]
+required = false
+default = "SOURCE_TARGET"
+read = true
+
 [fields.source_connection]
 header = "Source_Profile_Section"
 type = "string"
-required = true
+required = false
 read = true
 
 [fields.target_connection]
 header = "Target_Profile_Section"
 type = "string"
-required = true
+required = false
 read = true
 
 [fields.source_sql]
@@ -116,7 +138,7 @@ read = true
 [fields.comparison_rule]
 header = "Comparison_Type"
 type = "enum"
-allowed_values = ["equal", "expected_zero", "numeric_tolerance"]
+allowed_values = ["equal", "expected_zero", "numeric_tolerance", "no_comparison"]
 required = false
 default = "equal"
 read = true
@@ -130,11 +152,13 @@ read = true
 
 # No "Timeout Seconds" column in this template; always falls back to the
 # default below.
+# No "Timeout Seconds" column in this template, and the default is 0, which
+# means no limit: a query runs until the database answers it.
 [fields.timeout_seconds]
-header = "(not present in template — defaults to 120s)"
+header = "(not present in template — no query timeout)"
 type = "integer"
 required = false
-default = 120
+default = 0
 read = true
 
 # --------------------------------------------------------------------------
@@ -162,7 +186,15 @@ write = true
 [fields.status]
 header = "Status"
 type = "enum"
-allowed_values = ["PASS", "FAIL", "ERROR", "SKIPPED"]
+allowed_values = [
+  "PASS",
+  "FAIL",
+  "PROFILED",
+  "VALIDATED",
+  "NOT EXECUTED",
+  "ERROR",
+  "SKIPPED",
+]
 required = true
 write = true
 

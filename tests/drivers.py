@@ -52,7 +52,13 @@ def oracle_error(code: int, message: str, *, prefix: str = "ORA") -> FakeOracleE
 
 @dataclass
 class FakeCursor:
-    """One cursor. Records the SQL and the timeout it was given."""
+    """One cursor. Records the SQL it was given.
+
+    Deliberately has **no** ``timeout`` attribute, because a real
+    ``pyodbc.Cursor`` has none either: the query timeout belongs to the
+    connection. An adapter that assigns ``cursor.timeout`` now fails here
+    instead of only against a live database.
+    """
 
     connection: Any
     rows: list[list[Any]]
@@ -60,7 +66,6 @@ class FakeCursor:
     execute_error: Exception | None = None
     parse_error: Exception | None = None
     no_result_set: bool = False
-    timeout: int | None = None
     closed: bool = False
     description: Any = None
 
@@ -117,6 +122,9 @@ class FakeConnection:
     no_result_set: bool = False
     close_error: Exception | None = None
     version: str = "19.0.0.0.0"
+    #: pyodbc's query timeout, in seconds. 0 means no limit, as it does in the
+    #: real driver.
+    timeout: int = 0
     call_timeout: int = 0
     closed: bool = False
     close_count: int = 0
@@ -126,6 +134,8 @@ class FakeConnection:
     cursors: list[FakeCursor] = field(default_factory=list)
     closed_cursors: list[FakeCursor] = field(default_factory=list)
     call_timeouts_seen: list[int] = field(default_factory=list)
+    #: Every value assigned to :attr:`timeout`, in order.
+    timeouts_seen: list[int] = field(default_factory=list)
 
     def cursor(self) -> FakeCursor:
         cursor = FakeCursor(
@@ -153,6 +163,9 @@ class FakeConnection:
         # applied per query and then restored.
         if name == "call_timeout" and "call_timeouts_seen" in self.__dict__:
             self.__dict__["call_timeouts_seen"].append(value)
+        # Same for pyodbc's connection-level query timeout.
+        if name == "timeout" and "timeouts_seen" in self.__dict__:
+            self.__dict__["timeouts_seen"].append(value)
         object.__setattr__(self, name, value)
 
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..models import ComparisonRule, DatabaseType, WorkbookSchema
+from ..models import ComparisonRule, DatabaseType, ExecutionScope, WorkbookSchema
 from .schema import parse_schema
 
 __all__ = [
@@ -50,6 +50,7 @@ REQUIRED_INPUT_HEADERS: dict[str, str] = {
 #: Read when the column exists, defaulted when it does not.
 OPTIONAL_INPUT_HEADERS: dict[str, str] = {
     "enabled": "Enabled",
+    "execution_scope": "Execution Scope",
     "comparison_rule": "Comparison Rule",
     "tolerance": "Tolerance",
     "timeout_seconds": "Timeout Seconds",
@@ -79,7 +80,8 @@ EXTRA_RESULT_HEADERS: dict[str, str] = {
 #: Headers no spreadsheet uses, for the fields the wizard owns.
 _SENTINEL = "__wizard__{name}"
 
-DEFAULT_TIMEOUT_SECONDS = 120
+#: ``0`` means no limit: a query runs until the database answers.
+DEFAULT_TIMEOUT_SECONDS = 0
 
 
 def build_inline_schema(sheet_name: str, source_type: DatabaseType) -> WorkbookSchema:
@@ -112,6 +114,17 @@ def build_inline_schema(sheet_name: str, source_type: DatabaseType) -> WorkbookS
             "type": "boolean",
             "required": False,
             "default": True,
+            "read": True,
+        },
+        # Optional here: a sheet without the column runs both sides, which is
+        # what every two-sided reconciliation wants. A sheet that has it can
+        # express a one-sided test without a schema file.
+        "execution_scope": {
+            "header": OPTIONAL_INPUT_HEADERS["execution_scope"],
+            "type": "enum",
+            "allowed_values": [scope.value for scope in ExecutionScope],
+            "required": False,
+            "default": ExecutionScope.SOURCE_TARGET.value,
             "read": True,
         },
         "comparison_rule": {

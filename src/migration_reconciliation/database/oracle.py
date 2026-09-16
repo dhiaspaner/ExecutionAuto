@@ -40,7 +40,7 @@ from ..errors import (
 )
 from ..models import ConnectionIdentity, ScalarValue
 from ..security.redaction import sanitize_error
-from .base import single_scalar
+from .base import normalize_timeout, single_scalar
 from .failures import (
     FailureCause,
     classify_failure,
@@ -116,10 +116,6 @@ class OracleExecutor:
         production uses. Parsing needs no privilege beyond the one the query
         itself needs.
         """
-        if timeout_seconds <= 0:
-            raise DatabaseExecutionError(
-                f"Timeout must be greater than 0 seconds (got {timeout_seconds})"
-            )
         self.connect()
         connection = self._connection
         assert connection is not None  # connect() raises otherwise
@@ -128,7 +124,7 @@ class OracleExecutor:
         previous_timeout = getattr(connection, "call_timeout", 0)
         cursor = connection.cursor()
         try:
-            connection.call_timeout = timeout_seconds * 1000
+            connection.call_timeout = normalize_timeout(timeout_seconds) * 1000
             parse = getattr(cursor, "parse", None)
             if not callable(parse):
                 raise SyntaxCheckUnavailableError(
@@ -152,10 +148,6 @@ class OracleExecutor:
         translated. At most two rows are fetched, so a query that wrongly
         matches a whole table never pulls that table into this process.
         """
-        if timeout_seconds <= 0:
-            raise DatabaseExecutionError(
-                f"Timeout must be greater than 0 seconds (got {timeout_seconds})"
-            )
         self.connect()
         connection = self._connection
         assert connection is not None  # connect() raises otherwise
@@ -164,7 +156,7 @@ class OracleExecutor:
         previous_timeout = getattr(connection, "call_timeout", 0)
         cursor = connection.cursor()
         try:
-            connection.call_timeout = timeout_seconds * 1000
+            connection.call_timeout = normalize_timeout(timeout_seconds) * 1000
             try:
                 cursor.execute(sql)
             except Exception as exc:

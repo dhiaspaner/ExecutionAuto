@@ -11,7 +11,12 @@ import pytest
 from migration_reconciliation.database.base import QuerySide
 from migration_reconciliation.database.factory import FakeExecutorFactory
 from migration_reconciliation.errors import WorkbookError
-from migration_reconciliation.models import ErrorSide, ExecutionStatus
+from migration_reconciliation.models import (
+    ErrorSide,
+    ExecutionStatus,
+    OnSyntaxError,
+    RunMode,
+)
 from migration_reconciliation.runner import ReconciliationRunner, RunOptions
 
 
@@ -161,7 +166,9 @@ def test_unsafe_sql_is_rejected_before_any_executor_is_created(
     summary, factory = _run(schema, path, book)
 
     result = _by_id(summary)["TC-001"]
+    # Caught by the pre-execution check, so it never reaches the execution pass.
     assert result.status is ExecutionStatus.ERROR
+    assert result.error_code == "SQL_REJECTED"
     assert result.error_side is ErrorSide.SOURCE
     assert result.error_code == "SQL_REJECTED"
     assert factory.created == (), "no connection is opened for a rejected query"
@@ -342,7 +349,9 @@ def test_fail_fast_stops_after_the_first_problem(
     assert results["TC-003"].status is ExecutionStatus.SKIPPED
     assert results["TC-003"].remarks == "Stopped by --fail-fast"
     assert results["TC-004"].status is ExecutionStatus.SKIPPED
-    assert {e.test_case_id for e in factory.created} == {"TC-001", "TC-002"}
+    # Every case is compiled first, so every case has an executor; what
+    # --fail-fast stops is the *executing*, which only the first two reached.
+    assert {e.test_case_id for e in factory.created if e.executed_sql} == {"TC-001", "TC-002"}
 
 
 def test_without_fail_fast_every_case_runs(
@@ -433,3 +442,615 @@ def test_multi_row_result_is_rejected_as_an_error(
     assert result.status is ExecutionStatus.ERROR
     assert result.error_side is ErrorSide.SOURCE
     assert "25 rows" in result.remarks
+
+
+# ---------------------------------------------------------------------------
+# Scope: a side the test does not name is never opened, let alone queried.
+# ---------------------------------------------------------------------------
+
+
+def test_target_only_case_never_opens_the_source(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook(
+        [
+            case_row(
+                "TC-TGT-001",
+                execution_scope="TARGET_ONLY",
+                source_connection="",
+                source_sql="",
+                comparison_rule="expected_zero",
+            )
+        ]
+    )
+    book = make_results({"test_case_id": "TC-TGT-001", "target_result": 0})
+
+    summary, factory = _run(schema, path, book)
+
+    result = _by_id(summary)["TC-TGT-001"]
+    assert result.status is ExecutionStatus.PASS
+    assert result.target_result == 0
+    assert result.source_result is None
+    # The strongest guarantee: no source executor was ever created, so a
+    # one-sided test cannot be blocked by a database it has no business opening.
+    assert [executor.side for executor in factory.created] == [QuerySide.TARGET]
+
+
+def test_source_only_case_never_opens_the_target(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook(
+        [
+            case_row(
+                "TC-SRC-001",
+                execution_scope="SOURCE_ONLY",
+                target_connection="",
+                target_sql="",
+                comparison_rule="expected_zero",
+            )
+        ]
+    )
+    book = make_results({"test_case_id": "TC-SRC-001", "source_result": 0})
+
+    summary, factory = _run(schema, path, book)
+
+    result = _by_id(summary)["TC-SRC-001"]
+    assert result.status is ExecutionStatus.PASS
+    assert result.source_result == 0
+    assert [executor.side for executor in factory.created] == [QuerySide.SOURCE]
+
+
+def test_one_sided_expected_zero_still_fails_on_a_non_zero_count(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """Dropping the unused side must not make a real mismatch disappear."""
+    path = make_workbook(
+        [
+            case_row(
+                "TC-TGT-002",
+                execution_scope="TARGET_ONLY",
+                source_connection="",
+                source_sql="",
+                comparison_rule="expected_zero",
+            )
+        ]
+    )
+    book = make_results({"test_case_id": "TC-TGT-002", "target_result": 7})
+
+    summary, _ = _run(schema, path, book)
+
+    result = _by_id(summary)["TC-TGT-002"]
+    assert result.status is ExecutionStatus.FAIL
+    assert "target 7" in result.remarks
+
+
+def test_no_comparison_records_a_value_without_passing_it(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """A profiling row is reported as PROFILED, never as a green test."""
+    path = make_workbook(
+        [
+            case_row(
+                "TC-TGT-003",
+                execution_scope="TARGET_ONLY",
+                source_connection="",
+                source_sql="",
+                comparison_rule="no_comparison",
+            )
+        ]
+    )
+    book = make_results({"test_case_id": "TC-TGT-003", "target_result": 42})
+
+    summary, _ = _run(schema, path, book)
+
+    result = _by_id(summary)["TC-TGT-003"]
+    assert result.status is ExecutionStatus.PROFILED
+    assert result.status is not ExecutionStatus.PASS
+    assert result.target_result == 42
+    assert summary.is_clean is True
+
+
+def test_a_two_sided_rule_is_refused_on_a_one_sided_test(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """``equal`` has nothing to compare against, so it is an error, not a pass."""
+    path = make_workbook(
+        [
+            case_row(
+                "TC-TGT-004",
+                execution_scope="TARGET_ONLY",
+                source_connection="",
+                source_sql="",
+                comparison_rule="equal",
+            )
+        ]
+    )
+    book = make_results({"test_case_id": "TC-TGT-004", "target_result": 1})
+
+    summary, _ = _run(schema, path, book)
+
+    result = _by_id(summary)["TC-TGT-004"]
+    assert result.status is ExecutionStatus.ERROR
+    assert result.error_side is ErrorSide.COMPARISON
+    assert "cannot be used with Execution_Scope TARGET_ONLY" in result.remarks
+
+
+# ---------------------------------------------------------------------------
+# The pre-execution gate: compile everything, execute nothing until it passes.
+# ---------------------------------------------------------------------------
+
+
+def test_one_broken_query_costs_one_result_not_all_of_them(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """The default: record the rejected query as ERROR, run everything sound."""
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 4)])
+    book = make_results(
+        {"test_case_id": "TC-001", "source_result": 1, "target_result": 1},
+        {"test_case_id": "TC-002", "source_syntax_error": "Invalid object name 'Paymnets'"},
+        {"test_case_id": "TC-003", "source_result": 1, "target_result": 1},
+    )
+
+    summary, _ = _run(schema, path, book)
+
+    results = _by_id(summary)
+    assert results["TC-002"].status is ExecutionStatus.ERROR
+    assert results["TC-002"].error_code == "SQL_SYNTAX_ERROR"
+    assert "Invalid object name" in results["TC-002"].remarks
+    # The sound queries still produced results.
+    assert results["TC-001"].status is ExecutionStatus.PASS
+    assert results["TC-003"].status is ExecutionStatus.PASS
+    assert summary.syntax_errors == 1
+    assert not summary.is_clean
+
+
+def test_stop_policy_still_refuses_to_execute_anything(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """``--on-syntax-error stop``: a partial reconciliation is worse than none."""
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 4)])
+    book = make_results(
+        {"test_case_id": "TC-001", "source_result": 1, "target_result": 1},
+        {"test_case_id": "TC-002", "source_syntax_error": "Invalid object name 'Paymnets'"},
+        {"test_case_id": "TC-003", "source_result": 1, "target_result": 1},
+    )
+
+    summary, factory = _run(schema, path, book, on_syntax_error=OnSyntaxError.STOP)
+
+    results = _by_id(summary)
+    assert results["TC-002"].status is ExecutionStatus.ERROR
+    assert results["TC-001"].status is ExecutionStatus.NOT_EXECUTED
+    assert results["TC-003"].status is ExecutionStatus.NOT_EXECUTED
+    # A row whose own SQL was fine carries no error and no observation.
+    assert results["TC-001"].remarks == ""
+    assert results["TC-001"].error_code == ""
+    assert not any(executor.executed_sql for executor in factory.created)
+    assert summary.stopped_by_validation
+    assert not summary.is_clean
+
+
+def test_a_clean_compile_pass_executes_every_test(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 4)])
+    book = make_results(
+        *(
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 4)
+        )
+    )
+
+    summary, factory = _run(schema, path, book)
+
+    assert [r.status for r in summary.results] == [ExecutionStatus.PASS] * 3
+    assert summary.is_clean
+    assert not summary.stopped_by_validation
+    assert all(executor.executed_sql for executor in factory.created)
+
+
+def test_the_log_names_the_rejected_query_and_runs_the_rest(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row("TC-001"), case_row("TC-002")])
+    book = make_results(
+        {"test_case_id": "TC-001", "source_result": 1, "target_result": 1},
+        {"test_case_id": "TC-002", "source_syntax_error": "Invalid object name 'Paymnets'"},
+    )
+    lines: list[str] = []
+    factory = FakeExecutorFactory(book)
+    ReconciliationRunner(schema, factory).run(
+        path, RunOptions(write_output=False), on_progress=lines.append
+    )
+    joined = "\n".join(lines)
+
+    assert "Validation phase: compiling 2 test(s). No query is executed in this pass." in joined
+    assert "TC-001  ok" in joined
+    assert "1 of 2 test(s) were rejected by the database and are recorded as ERROR." in joined
+    assert "Invalid object name" in joined
+    assert "'Validation Errors' sheet" in joined
+    # The sound query still runs, and the log says so.
+    assert "Execution phase: running 1 test(s), one at a time." in joined
+
+
+def test_the_progress_log_carries_no_sql_and_no_credential(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row("TC-001", source_sql="SELECT COUNT(*) FROM SECRET_TABLE")])
+    book = make_results({"test_case_id": "TC-001", "source_result": 1, "target_result": 1})
+    lines: list[str] = []
+    ReconciliationRunner(schema, FakeExecutorFactory(book)).run(
+        path, RunOptions(write_output=False), on_progress=lines.append
+    )
+    joined = "\n".join(lines)
+
+    assert "SECRET_TABLE" not in joined
+    assert "password" not in joined.casefold()
+
+
+def test_the_validation_errors_sheet_names_every_rejected_query(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Any
+) -> None:
+    from openpyxl import load_workbook
+
+    path = make_workbook([case_row("TC-001"), case_row("TC-002")])
+    book = make_results(
+        {"test_case_id": "TC-001", "source_result": 1, "target_result": 1},
+        {"test_case_id": "TC-002", "source_syntax_error": "Invalid object name 'Paymnets'"},
+    )
+
+    summary, _ = _run(schema, path, book, write_output=True, output_dir=tmp_path)
+
+    assert summary.output_path is not None
+    result = load_workbook(summary.output_path)
+    assert "Validation Errors" in result.sheetnames
+    sheet = result["Validation Errors"]
+    headers = [cell.value for cell in sheet[1]]
+    body = [[cell.value for cell in row] for row in sheet.iter_rows(min_row=2)]
+    assert len(body) == 1
+    assert body[0][headers.index("Test_ID")] == "TC-002"
+    assert body[0][headers.index("Status")] == "SYNTAX ERROR"
+    assert "Invalid object name" in body[0][headers.index("Error_Detail")]
+    # The original workbook never gains the sheet.
+    assert "Validation Errors" not in load_workbook(path).sheetnames
+
+
+def test_a_clean_run_leaves_no_validation_errors_sheet(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Any
+) -> None:
+    from openpyxl import load_workbook
+
+    path = make_workbook([case_row("TC-001")])
+    book = make_results({"test_case_id": "TC-001", "source_result": 1, "target_result": 1})
+
+    summary, _ = _run(schema, path, book, write_output=True, output_dir=tmp_path)
+
+    assert summary.output_path is not None
+    assert "Validation Errors" not in load_workbook(summary.output_path).sheetnames
+
+
+def test_the_syntax_validation_sheet_records_every_test_that_was_checked(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Any
+) -> None:
+    """The full record, not just the failures: evidence every query was compiled."""
+    from openpyxl import load_workbook
+
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 4)])
+    book = make_results(
+        {"test_case_id": "TC-001", "source_result": 1, "target_result": 1},
+        {"test_case_id": "TC-002", "source_syntax_error": "Invalid object name 'Paymnets'"},
+        {"test_case_id": "TC-003", "source_result": 1, "target_result": 1},
+    )
+
+    summary, _ = _run(schema, path, book, write_output=True, output_dir=tmp_path)
+
+    assert summary.output_path is not None
+    sheet = load_workbook(summary.output_path)["Syntax Validation"]
+    headers = [cell.value for cell in sheet[1]]
+    body = [[cell.value for cell in row] for row in sheet.iter_rows(min_row=2)]
+    by_id = {row[headers.index("Test_ID")]: row for row in body}
+
+    assert set(by_id) == {"TC-001", "TC-002", "TC-003"}
+    assert by_id["TC-001"][headers.index("Result")] == "OK"
+    assert by_id["TC-003"][headers.index("Result")] == "OK"
+    assert by_id["TC-002"][headers.index("Result")] == "SYNTAX ERROR"
+    assert "Invalid object name" in by_id["TC-002"][headers.index("Error_Detail")]
+
+
+def test_the_syntax_validation_sheet_is_written_even_when_everything_compiles(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Any
+) -> None:
+    from openpyxl import load_workbook
+
+    path = make_workbook([case_row("TC-001"), case_row("TC-002")])
+    book = make_results(
+        *({"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1} for i in (1, 2))
+    )
+
+    summary, _ = _run(schema, path, book, write_output=True, output_dir=tmp_path)
+
+    assert summary.output_path is not None
+    result = load_workbook(summary.output_path)
+    # The report is always there; the errors sheet only when something failed.
+    assert "Syntax Validation" in result.sheetnames
+    assert "Validation Errors" not in result.sheetnames
+    sheet = result["Syntax Validation"]
+    headers = [cell.value for cell in sheet[1]]
+    body = [[cell.value for cell in row] for row in sheet.iter_rows(min_row=2)]
+    assert len(body) == 2
+    assert {row[headers.index("Result")] for row in body} == {"OK"}
+    # The original workbook never gains either sheet.
+    assert "Syntax Validation" not in load_workbook(path).sheetnames
+
+
+# ---------------------------------------------------------------------------
+# Run mode: validate only, or validate then execute.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_mode_compiles_every_query_and_executes_none(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 4)])
+    book = make_results(
+        *(
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 4)
+        )
+    )
+
+    summary, factory = _run(schema, path, book, mode=RunMode.VALIDATE)
+
+    assert [r.status for r in summary.results] == [ExecutionStatus.VALIDATED] * 3
+    assert all(executor.validated_sql for executor in factory.created)
+    assert not any(executor.executed_sql for executor in factory.created)
+    # Compiling everything successfully is a clean run, not an incomplete one.
+    assert summary.is_clean
+    assert summary.validated == 3
+
+
+def test_validate_mode_still_reports_a_query_that_will_not_compile(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row("TC-001"), case_row("TC-002")])
+    book = make_results(
+        {"test_case_id": "TC-001", "source_result": 1, "target_result": 1},
+        {"test_case_id": "TC-002", "source_syntax_error": "Invalid object name 'Paymnets'"},
+    )
+
+    summary, factory = _run(schema, path, book, mode=RunMode.VALIDATE)
+
+    results = _by_id(summary)
+    assert results["TC-002"].status is ExecutionStatus.ERROR
+    assert not summary.is_clean
+    assert not any(executor.executed_sql for executor in factory.created)
+
+
+def test_execute_mode_is_the_default_and_runs_the_queries(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row("TC-001")])
+    book = make_results({"test_case_id": "TC-001", "source_result": 1, "target_result": 1})
+
+    summary, factory = _run(schema, path, book)
+
+    assert RunOptions().mode is RunMode.EXECUTE
+    assert _by_id(summary)["TC-001"].status is ExecutionStatus.PASS
+    assert any(executor.executed_sql for executor in factory.created)
+
+
+def test_validate_mode_still_writes_the_validation_sheet(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Any
+) -> None:
+    from openpyxl import load_workbook
+
+    path = make_workbook([case_row("TC-001"), case_row("TC-002")])
+    book = make_results(
+        *({"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1} for i in (1, 2))
+    )
+
+    summary, _ = _run(
+        schema, path, book, mode=RunMode.VALIDATE, write_output=True, output_dir=tmp_path
+    )
+
+    assert summary.output_path is not None
+    result = load_workbook(summary.output_path)
+    assert "Syntax Validation" in result.sheetnames
+    assert "Validation Errors" not in result.sheetnames
+    sheet = result["Syntax Validation"]
+    headers = [cell.value for cell in sheet[1]]
+    body = [[cell.value for cell in row] for row in sheet.iter_rows(min_row=2)]
+    assert {row[headers.index("Result")] for row in body} == {"OK"}
+
+
+def test_validate_mode_says_it_stopped_on_purpose(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """A validation run that executes nothing must not look like a failure."""
+    path = make_workbook([case_row("TC-001")])
+    book = make_results({"test_case_id": "TC-001", "source_result": 1, "target_result": 1})
+    lines: list[str] = []
+    ReconciliationRunner(schema, FakeExecutorFactory(book)).run(
+        path,
+        RunOptions(write_output=False, mode=RunMode.VALIDATE),
+        on_progress=lines.append,
+    )
+    joined = "\n".join(lines)
+
+    assert "Validation phase" in joined
+    assert "Validation run: stopping here by request." in joined
+    assert "Execution phase" not in joined
+
+
+def test_each_row_carries_only_its_own_validation_error(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """Two different broken queries must not end up sharing one message."""
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 5)])
+    book = make_results(
+        {"test_case_id": "TC-001", "source_result": 1, "target_result": 1},
+        {"test_case_id": "TC-002", "source_syntax_error": "Invalid object name 'Paymnets'"},
+        {"test_case_id": "TC-003", "source_syntax_error": "Incorrect syntax near 'FORM'"},
+        {"test_case_id": "TC-004", "source_result": 1, "target_result": 1},
+    )
+
+    summary, _ = _run(schema, path, book)
+    results = _by_id(summary)
+
+    assert "Invalid object name" in results["TC-002"].remarks
+    assert "Incorrect syntax" not in results["TC-002"].remarks
+    assert "Incorrect syntax" in results["TC-003"].remarks
+    assert "Invalid object name" not in results["TC-003"].remarks
+    # The two sound queries ran, and report their own comparison — never
+    # someone else's error.
+    for good in ("TC-001", "TC-004"):
+        assert results[good].status is ExecutionStatus.PASS
+        assert results[good].error_code == ""
+        assert "Invalid object name" not in results[good].remarks
+        assert "Incorrect syntax" not in results[good].remarks
+
+
+def test_a_validated_row_carries_no_error_and_no_observation(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row("TC-001"), case_row("TC-002")])
+    book = make_results(
+        *({"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1} for i in (1, 2))
+    )
+
+    summary, _ = _run(schema, path, book, mode=RunMode.VALIDATE)
+
+    for result in summary.results:
+        assert result.status is ExecutionStatus.VALIDATED
+        assert result.remarks == ""
+        assert result.error_code == ""
+        assert result.error_side is ErrorSide.NONE
+
+
+# ---------------------------------------------------------------------------
+# Dialect mismatches are caught offline, before any round trip.
+# ---------------------------------------------------------------------------
+
+
+def test_foreign_dialect_is_caught_without_asking_the_database(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """Oracle SQL bound for a SQL Server connection needs no round trip to refuse."""
+    path = make_workbook(
+        [
+            case_row(
+                "TC-ORA-001",
+                source_type="sqlserver",
+                source_sql="SELECT COUNT(*) FROM V WHERE CREATED >= DATE '2023-01-01'",
+            )
+        ]
+    )
+    book = make_results({"test_case_id": "TC-ORA-001", "source_result": 1, "target_result": 1})
+
+    summary, factory = _run(schema, path, book)
+
+    result = _by_id(summary)["TC-ORA-001"]
+    assert result.status is ExecutionStatus.ERROR
+    assert result.error_code == "SQL_DIALECT_MISMATCH"
+    assert "Oracle syntax" in result.remarks
+    assert result.error_side is ErrorSide.SOURCE
+    # The point of the check: the database was never asked about this query.
+    assert not any(executor.validated_sql for executor in factory.created)
+    assert not any(executor.executed_sql for executor in factory.created)
+
+
+def test_portable_sql_still_goes_to_the_database(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """The offline check never replaces the compiler; it only answers early."""
+    path = make_workbook([case_row("TC-001")])
+    book = make_results({"test_case_id": "TC-001", "source_result": 1, "target_result": 1})
+
+    summary, factory = _run(schema, path, book)
+
+    assert _by_id(summary)["TC-001"].status is ExecutionStatus.PASS
+    assert any(executor.validated_sql for executor in factory.created)
+
+
+def test_a_foreign_dialect_stops_the_whole_run(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    """The wrong profile for these rows, not one bad query.
+
+    The SQL may be perfectly valid on the database it was written for, so
+    half-running the workbook against the other engine would produce a
+    reconciliation missing part of its evidence — worse than no run.
+    """
+    path = make_workbook(
+        [
+            case_row("TC-001"),
+            # The fixture's source is Oracle, so T-SQL is the mismatch here.
+            case_row("TC-BAD", source_sql="SELECT COUNT_BIG(*) FROM dbo.T"),
+            case_row("TC-002"),
+        ]
+    )
+    book = make_results(
+        *(
+            {"test_case_id": t, "source_result": 1, "target_result": 1}
+            for t in ("TC-001", "TC-BAD", "TC-002")
+        )
+    )
+
+    summary, factory = _run(schema, path, book)
+
+    results = _by_id(summary)
+    assert results["TC-BAD"].status is ExecutionStatus.ERROR
+    assert results["TC-BAD"].error_code == "SQL_DIALECT_MISMATCH"
+    assert "SQL Server syntax" in results["TC-BAD"].remarks
+    # The sound rows are neither validated nor executed.
+    assert results["TC-001"].status is ExecutionStatus.NOT_EXECUTED
+    assert results["TC-002"].status is ExecutionStatus.NOT_EXECUTED
+    assert not any(executor.validated_sql for executor in factory.created)
+    assert not any(executor.executed_sql for executor in factory.created)
+    assert not summary.is_clean
+
+
+def test_the_platform_mismatch_is_explained_and_names_the_rows(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook([case_row("TC-001"), case_row("TC-BAD", source_sql="SELECT GETDATE()")])
+    book = make_results(
+        *({"test_case_id": t, "source_result": 1, "target_result": 1} for t in ("TC-001", "TC-BAD"))
+    )
+    lines: list[str] = []
+    ReconciliationRunner(schema, FakeExecutorFactory(book)).run(
+        path, RunOptions(write_output=False), on_progress=lines.append
+    )
+    joined = "\n".join(lines)
+
+    assert "PLATFORM MISMATCH" in joined
+    assert "TC-BAD" in joined
+    assert "Nothing was validated and nothing was executed" in joined
+    assert "once per platform" in joined
+    # It never reached either later phase.
+    assert "Validation phase" not in joined
+    assert "Execution phase" not in joined
+
+
+def test_a_mismatched_run_still_writes_its_evidence(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Any
+) -> None:
+    from openpyxl import load_workbook
+
+    path = make_workbook([case_row("TC-001"), case_row("TC-BAD", source_sql="SELECT GETDATE()")])
+    book = make_results(
+        *({"test_case_id": t, "source_result": 1, "target_result": 1} for t in ("TC-001", "TC-BAD"))
+    )
+
+    summary, _ = _run(schema, path, book, write_output=True, output_dir=tmp_path)
+
+    assert summary.output_path is not None
+    result = load_workbook(summary.output_path)
+    sheet = result["Syntax Validation"]
+    headers = [cell.value for cell in sheet[1]]
+    body = [[cell.value for cell in row] for row in sheet.iter_rows(min_row=2)]
+    by_id = {row[headers.index("Test_ID")]: row for row in body}
+
+    assert by_id["TC-BAD"][headers.index("Result")] == "PLATFORM MISMATCH"
+    # The others were never put to the database, and the sheet says so rather
+    # than implying they were checked and found sound.
+    assert by_id["TC-001"][headers.index("Result")] == "NOT CHECKED"
