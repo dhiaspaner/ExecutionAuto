@@ -23,9 +23,11 @@
 #   - There is no "Error Side" column in the template, so `error_side` (a
 #     mandatory write field) is declared with a header that does not exist in
 #     the sheet and is required = false, so it is simply never written.
-#   - There is no "Source DB Type" column, so `source_type` (a mandatory read
-#     field) always falls back to its default ("sqlserver"), matching this
-#     domain's queries (T-SQL: DATEADD, COUNT_BIG, CAST(... AS date)).
+#   - There is no "Source DB Type" column, and none is invented: the engine of
+#     each row comes from the connection its Source_Profile_Section names, so
+#     changing a profile's type reaches the dialect check. A template that does
+#     have such a column can map `source_type` to it, and the declaration is
+#     then checked against the connection rather than replacing it.
 #   - Decorative/tracking-only template columns (Test_Name, Execution_Scope,
 #     Result_Type, Source_Object, Target_Object, Owner, Tags, Actual_Value,
 #     Variance_Percentage, Evidence_Path) are not mapped to anything; the
@@ -86,17 +88,6 @@ read = true
 header = "Expected_Value"
 type = "string"
 required = false
-read = true
-
-# No "Source DB Type" column in this template; always falls back to the
-# default below. The header text is a sentinel that cannot match a real
-# column.
-[fields.source_type]
-header = "(not present in template — defaults to sqlserver)"
-type = "enum"
-allowed_values = ["oracle", "sqlserver"]
-required = false
-default = "sqlserver"
 read = true
 
 # The template's Execution_Scope column. It decides which sides a row needs,

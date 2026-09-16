@@ -306,10 +306,10 @@ def test_an_unreachable_source_stops_the_run_with_a_sanitized_message(
 def test_a_query_the_server_will_not_compile_is_an_error_and_the_rest_still_run(
     workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
 ) -> None:
-    """An invalid object name is caught by the compile pass, not by executing it.
+    """An execute run finds an invalid object name by running the query.
 
-    ``SET NOEXEC ON`` rejects an unknown table, so the run finds it before
-    executing anything. That test is recorded as ERROR and the two sound
+    There is no compile pass in execute mode, so the database reports the bad
+    table when that test runs. It is recorded as ERROR and the two sound
     queries still run: one broken row costs one result, not all of them.
     """
     console.script(answers_for(workbook))
@@ -327,11 +327,11 @@ def test_a_query_the_server_will_not_compile_is_an_error_and_the_rest_still_run(
 
     out = capsys.readouterr().out
     assert code == run_reconciliation.EXIT_FAILURES
-    assert "Validation phase" in out
-    assert "recorded as ERROR" in out
+    # No compile pass: the run starts executing straight away.
+    assert "Validation phase" not in out
+    assert "Execution phase" in out
     assert "Invalid object name" in out
     # The sound queries still ran.
-    assert "Execution phase" in out
     assert "2 passed" in out
 
 

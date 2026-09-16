@@ -223,7 +223,10 @@ class TestCase:
 
     test_case_id: str
     row_number: int
-    source_type: DatabaseType
+    #: What the workbook asserts the source engine is. ``None`` when the sheet
+    #: does not say, in which case the connection named by the row decides and
+    #: nothing is asserted against it.
+    source_type: DatabaseType | None
     source_connection: str
     target_connection: str
     source_sql: str

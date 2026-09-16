@@ -41,7 +41,6 @@ SUPPORTED_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0"})
 MANDATORY_READ_FIELDS: tuple[str, ...] = (
     "test_case_id",
     "execution_scope",
-    "source_type",
     "source_connection",
     "target_connection",
     "source_sql",

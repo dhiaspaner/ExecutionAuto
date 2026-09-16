@@ -583,11 +583,11 @@ def test_a_two_sided_rule_is_refused_on_a_one_sided_test(
 def test_one_broken_query_costs_one_result_not_all_of_them(
     make_workbook: Any, case_row: Any, schema: Any, make_results: Any
 ) -> None:
-    """The default: record the rejected query as ERROR, run everything sound."""
+    """An execute run finds a bad query by running it, and carries on."""
     path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 4)])
     book = make_results(
         {"test_case_id": "TC-001", "source_result": 1, "target_result": 1},
-        {"test_case_id": "TC-002", "source_syntax_error": "Invalid object name 'Paymnets'"},
+        {"test_case_id": "TC-002", "source_error": "Invalid object name 'Paymnets'"},
         {"test_case_id": "TC-003", "source_result": 1, "target_result": 1},
     )
 
@@ -595,12 +595,10 @@ def test_one_broken_query_costs_one_result_not_all_of_them(
 
     results = _by_id(summary)
     assert results["TC-002"].status is ExecutionStatus.ERROR
-    assert results["TC-002"].error_code == "SQL_SYNTAX_ERROR"
     assert "Invalid object name" in results["TC-002"].remarks
     # The sound queries still produced results.
     assert results["TC-001"].status is ExecutionStatus.PASS
     assert results["TC-003"].status is ExecutionStatus.PASS
-    assert summary.syntax_errors == 1
     assert not summary.is_clean
 
 
@@ -648,7 +646,7 @@ def test_a_clean_compile_pass_executes_every_test(
     assert all(executor.executed_sql for executor in factory.created)
 
 
-def test_the_log_names_the_rejected_query_and_runs_the_rest(
+def test_an_execute_run_starts_executing_without_compiling_first(
     make_workbook: Any, case_row: Any, schema: Any, make_results: Any
 ) -> None:
     path = make_workbook([case_row("TC-001"), case_row("TC-002")])
@@ -663,13 +661,10 @@ def test_the_log_names_the_rejected_query_and_runs_the_rest(
     )
     joined = "\n".join(lines)
 
-    assert "Validation phase: compiling 2 test(s). No query is executed in this pass." in joined
-    assert "TC-001  ok" in joined
-    assert "1 of 2 test(s) were rejected by the database and are recorded as ERROR." in joined
-    assert "Invalid object name" in joined
-    assert "'Validation Errors' sheet" in joined
-    # The sound query still runs, and the log says so.
-    assert "Execution phase: running 1 test(s), one at a time." in joined
+    # An execute run does not compile first: it starts executing.
+    assert "Validation phase" not in joined
+    assert "Execution phase: running 2 test(s), one at a time." in joined
+    assert "TC-001  PASS" in joined
 
 
 def test_the_progress_log_carries_no_sql_and_no_credential(
@@ -698,7 +693,9 @@ def test_the_validation_errors_sheet_names_every_rejected_query(
         {"test_case_id": "TC-002", "source_syntax_error": "Invalid object name 'Paymnets'"},
     )
 
-    summary, _ = _run(schema, path, book, write_output=True, output_dir=tmp_path)
+    summary, _ = _run(
+        schema, path, book, mode=RunMode.VALIDATE, write_output=True, output_dir=tmp_path
+    )
 
     assert summary.output_path is not None
     result = load_workbook(summary.output_path)
@@ -741,7 +738,9 @@ def test_the_syntax_validation_sheet_records_every_test_that_was_checked(
         {"test_case_id": "TC-003", "source_result": 1, "target_result": 1},
     )
 
-    summary, _ = _run(schema, path, book, write_output=True, output_dir=tmp_path)
+    summary, _ = _run(
+        schema, path, book, mode=RunMode.VALIDATE, write_output=True, output_dir=tmp_path
+    )
 
     assert summary.output_path is not None
     sheet = load_workbook(summary.output_path)["Syntax Validation"]
@@ -766,7 +765,9 @@ def test_the_syntax_validation_sheet_is_written_even_when_everything_compiles(
         *({"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1} for i in (1, 2))
     )
 
-    summary, _ = _run(schema, path, book, write_output=True, output_dir=tmp_path)
+    summary, _ = _run(
+        schema, path, book, mode=RunMode.VALIDATE, write_output=True, output_dir=tmp_path
+    )
 
     assert summary.output_path is not None
     result = load_workbook(summary.output_path)
@@ -893,7 +894,7 @@ def test_each_row_carries_only_its_own_validation_error(
         {"test_case_id": "TC-004", "source_result": 1, "target_result": 1},
     )
 
-    summary, _ = _run(schema, path, book)
+    summary, _ = _run(schema, path, book, mode=RunMode.VALIDATE)
     results = _by_id(summary)
 
     assert "Invalid object name" in results["TC-002"].remarks
@@ -903,7 +904,7 @@ def test_each_row_carries_only_its_own_validation_error(
     # The two sound queries ran, and report their own comparison — never
     # someone else's error.
     for good in ("TC-001", "TC-004"):
-        assert results[good].status is ExecutionStatus.PASS
+        assert results[good].status is ExecutionStatus.VALIDATED
         assert results[good].error_code == ""
         assert "Invalid object name" not in results[good].remarks
         assert "Incorrect syntax" not in results[good].remarks
@@ -965,20 +966,20 @@ def test_portable_sql_still_goes_to_the_database(
     path = make_workbook([case_row("TC-001")])
     book = make_results({"test_case_id": "TC-001", "source_result": 1, "target_result": 1})
 
-    summary, factory = _run(schema, path, book)
+    summary, factory = _run(schema, path, book, mode=RunMode.VALIDATE)
 
-    assert _by_id(summary)["TC-001"].status is ExecutionStatus.PASS
+    assert _by_id(summary)["TC-001"].status is ExecutionStatus.VALIDATED
     assert any(executor.validated_sql for executor in factory.created)
 
 
-def test_a_foreign_dialect_stops_the_whole_run(
+def test_a_foreign_dialect_costs_one_result_not_the_run(
     make_workbook: Any, case_row: Any, schema: Any, make_results: Any
 ) -> None:
-    """The wrong profile for these rows, not one bad query.
+    """Judged against the connection the row itself names.
 
-    The SQL may be perfectly valid on the database it was written for, so
-    half-running the workbook against the other engine would produce a
-    reconciliation missing part of its evidence — worse than no run.
+    A workbook whose sources span two platforms is legal once each row names
+    its own connection, so a wrongly-paired row is an error like any other and
+    the correctly-paired rows still run.
     """
     path = make_workbook(
         [
@@ -1001,15 +1002,14 @@ def test_a_foreign_dialect_stops_the_whole_run(
     assert results["TC-BAD"].status is ExecutionStatus.ERROR
     assert results["TC-BAD"].error_code == "SQL_DIALECT_MISMATCH"
     assert "SQL Server syntax" in results["TC-BAD"].remarks
-    # The sound rows are neither validated nor executed.
-    assert results["TC-001"].status is ExecutionStatus.NOT_EXECUTED
-    assert results["TC-002"].status is ExecutionStatus.NOT_EXECUTED
-    assert not any(executor.validated_sql for executor in factory.created)
-    assert not any(executor.executed_sql for executor in factory.created)
+    # The correctly-paired rows still ran.
+    assert results["TC-001"].status is ExecutionStatus.PASS
+    assert results["TC-002"].status is ExecutionStatus.PASS
+    assert any(executor.executed_sql for executor in factory.created)
     assert not summary.is_clean
 
 
-def test_the_platform_mismatch_is_explained_and_names_the_rows(
+def test_a_dialect_mismatch_is_explained_and_names_the_rows(
     make_workbook: Any, case_row: Any, schema: Any, make_results: Any
 ) -> None:
     path = make_workbook([case_row("TC-001"), case_row("TC-BAD", source_sql="SELECT GETDATE()")])
@@ -1022,13 +1022,10 @@ def test_the_platform_mismatch_is_explained_and_names_the_rows(
     )
     joined = "\n".join(lines)
 
-    assert "PLATFORM MISMATCH" in joined
+    assert "name a connection that speaks a different dialect" in joined
     assert "TC-BAD" in joined
-    assert "Nothing was validated and nothing was executed" in joined
-    assert "once per platform" in joined
-    # It never reached either later phase.
-    assert "Validation phase" not in joined
-    assert "Execution phase" not in joined
+    # The run carries on with the rows that are correctly paired.
+    assert "Execution phase: running 1 test(s), one at a time." in joined
 
 
 def test_a_mismatched_run_still_writes_its_evidence(
@@ -1051,6 +1048,6 @@ def test_a_mismatched_run_still_writes_its_evidence(
     by_id = {row[headers.index("Test_ID")]: row for row in body}
 
     assert by_id["TC-BAD"][headers.index("Result")] == "PLATFORM MISMATCH"
-    # The others were never put to the database, and the sheet says so rather
-    # than implying they were checked and found sound.
-    assert by_id["TC-001"][headers.index("Result")] == "NOT CHECKED"
+    # An execute run compiles nothing, so the correctly-paired row is absent
+    # rather than claimed as checked.
+    assert "TC-001" not in by_id

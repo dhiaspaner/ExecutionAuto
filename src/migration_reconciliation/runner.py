@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -181,6 +181,25 @@ class ReconciliationRunner:
         self._schema = schema
         self._factory = factory
 
+    def _engine_of(
+        self, connection_name: str, side: QuerySide, declared: DatabaseType | None
+    ) -> DatabaseType | None:
+        """What engine this query will really meet.
+
+        The connection is the authority: a workbook constant describes what the
+        author meant, while the profile decides what the query is actually sent
+        to. Asking the connection is what makes changing a profile's engine
+        reach the dialect check at all. Factories that cannot say — the offline
+        fakes — fall back to the workbook's own declaration.
+        """
+        ask = getattr(self._factory, "engine_of", None)
+        if ask is None:
+            return declared
+        try:
+            return ask(connection_name, side)
+        except Exception:  # a factory that cannot resolve the name proves nothing
+            return declared
+
     def check_dialects(
         self, cases: Sequence[TestCase], run_id: str, *, log: ProgressLog
     ) -> tuple[ExecutionResult, ...]:
@@ -189,11 +208,11 @@ class ReconciliationRunner:
         Offline and instant: no connection is used and no query is sent, so
         this answers before there is anything to wait for.
 
-        A foreign dialect is not one bad query — it is the wrong profile for
-        these rows. The SQL may be perfectly correct on the database it was
-        written for, so the run is stopped rather than the rows being failed
-        one by one: a workbook whose sources span two platforms is meant to be
-        run once per platform, not half-run against one of them.
+        Each row is judged against the connection *it* names, not against one
+        source for the whole run. A workbook whose sources span two platforms
+        is therefore legal: the Oracle rows name an Oracle connection, the SQL
+        Server rows name a SQL Server one, and only a row pointing at the wrong
+        one is an error. That row costs one result; the rest still run.
         """
         checked_at = datetime.now(UTC).replace(microsecond=0)
         mismatches: list[ExecutionResult] = []
@@ -201,11 +220,26 @@ class ReconciliationRunner:
             scope = case.execution_scope
             sides = []
             if scope.uses_source:
-                sides.append((case.source_sql, ErrorSide.SOURCE, case.source_type))
+                sides.append(
+                    (
+                        case.source_sql,
+                        ErrorSide.SOURCE,
+                        self._engine_of(case.source_connection, QuerySide.SOURCE, case.source_type),
+                    )
+                )
             if scope.uses_target:
-                # The migration target is always SQL Server.
-                sides.append((case.target_sql, ErrorSide.TARGET, DatabaseType.SQLSERVER))
+                sides.append(
+                    (
+                        case.target_sql,
+                        ErrorSide.TARGET,
+                        self._engine_of(
+                            case.target_connection, QuerySide.TARGET, DatabaseType.SQLSERVER
+                        ),
+                    )
+                )
             for sql, error_side, engine in sides:
+                if engine is None:
+                    continue
                 mismatch = describe_incompatibility(sql, engine)
                 if mismatch is None:
                     continue
@@ -219,23 +253,14 @@ class ReconciliationRunner:
         if mismatches:
             log("")
             log(
-                f"PLATFORM MISMATCH: {len(mismatches)} of {len(cases)} test(s) are written "
-                f"for a different database engine than this profile configures."
+                f"  {len(mismatches)} of {len(cases)} test(s) name a connection that speaks "
+                f"a different dialect, and are recorded as ERROR."
             )
             for result in mismatches[:_NAMED_IN_MISMATCH_MESSAGE]:
                 log(f"    row {result.row_number}  {result.test_case_id}  {_short(result.remarks)}")
-            remaining = len(mismatches) - _NAMED_IN_MISMATCH_MESSAGE
-            if remaining > 0:
-                log(f"    ... and {remaining} more")
-            log("")
-            log(
-                "  Nothing was validated and nothing was executed: the profile is wrong for "
-                "these rows, not the SQL."
-            )
-            log(
-                "  A workbook whose sources span two platforms is run once per platform, "
-                "with only that platform's rows enabled."
-            )
+            unnamed = len(mismatches) - _NAMED_IN_MISMATCH_MESSAGE
+            if unnamed > 0:
+                log(f"    ... and {unnamed} more")
         return tuple(mismatches)
 
     def validate_cases(
@@ -438,40 +463,58 @@ class ReconciliationRunner:
         )
 
         validation = ValidationOutcome(passed=tuple(selected))
-        stopped_early = False
         try:
-            # Before anything is opened, compiled or waited for: are these rows
-            # even written for the databases this profile names?
+            # Before anything is opened, compiled or waited for: does each row
+            # match the connection it names? Offline, so a wrong pairing costs
+            # nothing to find.
             mismatches = self.check_dialects(selected, opts.run_id, log=log)
-            if mismatches:
-                mismatched_ids = {result.test_case_id for result in mismatches}
-                results.extend(mismatches)
-                checked_at = datetime.now(UTC).replace(microsecond=0)
-                results.extend(
-                    self._not_executed(case, opts.run_id, checked_at)
-                    for case in selected
-                    if case.test_case_id not in mismatched_ids
+            mismatched_ids = {result.test_case_id for result in mismatches}
+            results.extend(mismatches)
+            # A row bound for the wrong engine is not sent to any database, but
+            # it no longer stops the rows that are correctly paired.
+            mismatch_rows = tuple(
+                _validation_row(
+                    case,
+                    opts.run_id,
+                    datetime.now(UTC).replace(microsecond=0),
+                    _SHEET_RESULT_MISMATCH,
+                    ErrorSide.NONE,
+                    "",
+                    "",
                 )
-                outcome = ValidationOutcome(
+                for case in selected
+                if case.test_case_id in mismatched_ids
+            )
+            selected = [c for c in selected if c.test_case_id not in mismatched_ids]
+
+            # Compiling every query costs a second round trip per test. An
+            # execute run skips it and lets the database report a bad query
+            # when it runs one, which is what asking for results means. Ask
+            # for the check by running --mode validate, or keep the gate in an
+            # execute run with --on-syntax-error stop.
+            compiles_first = (
+                opts.mode is RunMode.VALIDATE or opts.on_syntax_error is OnSyntaxError.STOP
+            )
+            if not compiles_first:
+                validation = replace(
+                    ValidationOutcome(passed=tuple(selected)),
                     failures=mismatches,
-                    rows=tuple(
-                        _validation_row(
-                            case,
-                            opts.run_id,
-                            checked_at,
-                            _SHEET_RESULT_MISMATCH
-                            if case.test_case_id in mismatched_ids
-                            else _SHEET_RESULT_UNCHECKED,
-                            ErrorSide.NONE,
-                            "",
-                            "",
-                        )
-                        for case in selected
-                    ),
+                    rows=mismatch_rows,
                 )
-                return self._finish(path, opts, started_at, results, deselected, outcome)
+                results.extend(mismatches)
+                log("")
+                log(f"Execution phase: running {len(selected)} test(s), one at a time.")
+                self._execute_all(selected, opts, results, log)
+                return self._finish(path, opts, started_at, results, deselected, validation)
 
             validation = self.validate_cases(selected, opts.run_id, log=log)
+            # Mismatched rows belong on the evidence sheets too, even though
+            # they never reached the database.
+            validation = replace(
+                validation,
+                failures=(*mismatches, *validation.failures),
+                rows=(*mismatch_rows, *validation.rows),
+            )
             results.extend(validation.failures)
             if validation.gate_closed:
                 log("")
@@ -514,30 +557,39 @@ class ReconciliationRunner:
             else:
                 log("")
                 log(f"Execution phase: running {len(validation.passed)} test(s), one at a time.")
-                for index, case in enumerate(validation.passed, start=1):
-                    if stopped_early:
-                        halted = SkippedRow(
-                            case.row_number, case.test_case_id, "Stopped by --fail-fast"
-                        )
-                        results.append(self._skipped_result(halted, opts.run_id, started_at))
-                        continue
-                    result = self.execute_case(case, opts.run_id)
-                    results.append(result)
-                    detail = (
-                        f"  [{result.error_code}] {_short(result.remarks)}"
-                        if result.error_code
-                        else ""
-                    )
-                    log(
-                        f"  [{index:>4}/{len(validation.passed)}] {case.test_case_id}  "
-                        f"{result.status.value}{detail}"
-                    )
-                    if opts.fail_fast and result.status is not ExecutionStatus.PASS:
-                        stopped_early = True
+                self._execute_all(validation.passed, opts, results, log)
         finally:
             self._factory.close_all()
 
         return self._finish(path, opts, started_at, results, deselected, validation)
+
+    def _execute_all(
+        self,
+        cases: Sequence[TestCase],
+        opts: RunOptions,
+        results: list[ExecutionResult],
+        log: ProgressLog,
+    ) -> None:
+        """Run each test in row order, reporting as it goes.
+
+        Shared by both routes into execution, so a run that skipped the
+        compile pass behaves identically once it starts executing.
+        """
+        stopped_reason = ""
+        total = len(cases)
+        for index, case in enumerate(cases, start=1):
+            if stopped_reason:
+                halted = SkippedRow(case.row_number, case.test_case_id, stopped_reason)
+                results.append(self._skipped_result(halted, opts.run_id, datetime.now(UTC)))
+                continue
+            result = self.execute_case(case, opts.run_id)
+            results.append(result)
+            detail = (
+                f"  [{result.error_code}] {_short(result.remarks)}" if result.error_code else ""
+            )
+            log(f"  [{index:>4}/{total}] {case.test_case_id}  {result.status.value}{detail}")
+            if opts.fail_fast and result.status is not ExecutionStatus.PASS:
+                stopped_reason = "Stopped by --fail-fast"
 
     def _finish(
         self,
@@ -689,10 +741,17 @@ class ReconciliationRunner:
 
     def _executor_for(self, case: TestCase, side: QuerySide) -> QueryExecutor:
         if side is QuerySide.SOURCE:
-            connection_name, database_type = case.source_connection, case.source_type
+            connection_name, declared = case.source_connection, case.source_type
         else:
-            # The migration target is always SQL Server.
-            connection_name, database_type = case.target_connection, DatabaseType.SQLSERVER
+            # The migration target is a SQL Server database, whichever
+            # connection the row names for it.
+            connection_name, declared = case.target_connection, DatabaseType.SQLSERVER
+        # A sheet that declares an engine is asserting something and is checked
+        # against the connection. A sheet that says nothing asserts nothing, so
+        # the connection's own engine is used and nothing can contradict it.
+        database_type = declared or self._engine_of(connection_name, side, None)
+        if database_type is None:
+            database_type = DatabaseType.SQLSERVER
         return self._factory.get_executor(
             connection_name=connection_name,
             database_type=database_type,

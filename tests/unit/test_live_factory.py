@@ -206,3 +206,46 @@ def test_a_matching_engine_is_handed_out_as_before() -> None:
         test_case_id="TC-002",
         side=QuerySide.SOURCE,
     ), "every case still shares one connection per side"
+
+
+def test_a_connection_is_addressed_by_name_not_by_side() -> None:
+    """Side is a role label; the name decides which connection answers."""
+    factory = LiveExecutorFactory(
+        settings(QuerySide.SOURCE, DatabaseType.ORACLE),
+        settings(QuerySide.TARGET, DatabaseType.SQLSERVER),
+        source_driver=FakeOracleDb(),
+        target_driver=FakePyodbc(),
+    )
+
+    assert factory.engine_of("source", QuerySide.SOURCE) is DatabaseType.ORACLE
+    assert factory.engine_of("target", QuerySide.TARGET) is DatabaseType.SQLSERVER
+    # Case and padding are how people type, not how they mean.
+    assert factory.engine_of("  SOURCE ", QuerySide.TARGET) is DatabaseType.ORACLE
+
+
+def test_an_unknown_name_falls_back_to_its_own_side() -> None:
+    """A workbook using a local label for the usual two sides still runs."""
+    factory = LiveExecutorFactory(
+        settings(QuerySide.SOURCE, DatabaseType.ORACLE),
+        settings(QuerySide.TARGET, DatabaseType.SQLSERVER),
+        source_driver=FakeOracleDb(),
+        target_driver=FakePyodbc(),
+    )
+
+    assert factory.engine_of("LEGACY_ORACLE", QuerySide.SOURCE) is DatabaseType.ORACLE
+
+
+def test_the_engine_reported_follows_the_profile_not_the_workbook() -> None:
+    """Changing [source] type must reach whatever asks, which it did not before."""
+    for engine, driver in (
+        (DatabaseType.SQLSERVER, FakePyodbc()),
+        (DatabaseType.ORACLE, FakeOracleDb()),
+    ):
+        factory = LiveExecutorFactory(
+            settings(QuerySide.SOURCE, engine),
+            settings(QuerySide.TARGET, DatabaseType.SQLSERVER),
+            source_driver=driver,
+            target_driver=FakePyodbc(),
+        )
+
+        assert factory.engine_of("source", QuerySide.SOURCE) is engine

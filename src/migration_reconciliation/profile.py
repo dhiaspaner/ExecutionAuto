@@ -19,7 +19,8 @@ authentication, which needs no credential at all.
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +40,12 @@ __all__ = [
 
 SUPPORTED_PROFILE_VERSIONS: frozenset[str] = frozenset({"1.0"})
 
-_ALLOWED_TOP_LEVEL_KEYS = frozenset({"version", "workbook", "source", "target"})
+_ALLOWED_TOP_LEVEL_KEYS = frozenset({"version", "workbook", "source", "target", "connections"})
+
+#: ``[source]`` and ``[target]`` are the original two connections. They are kept
+#: as names in their own right so every existing profile and workbook keeps
+#: working: a cell saying "source" resolves the same way it always did.
+_ALIAS_SECTIONS: tuple[str, ...] = ("source", "target")
 _ALLOWED_WORKBOOK_KEYS = frozenset({"path", "sheet", "schema"})
 _ALLOWED_SOURCE_KEYS = frozenset(
     {
@@ -119,6 +125,10 @@ class RunProfile:
 
     source: ConnectionProfile
     target: ConnectionProfile
+    #: Every connection this profile defines, by name. ``source`` and
+    #: ``target`` always appear here too, so a lookup never has to know which
+    #: spelling a profile used.
+    connections: Mapping[str, ConnectionProfile] = field(default_factory=dict)
     workbook_path: Path | None = None
     sheet_name: str | None = None
     #: The workbook schema DSL to read the sheet with. ``None`` leaves the
@@ -133,11 +143,22 @@ class RunProfile:
 
     def section(self, name: str) -> ConnectionProfile | None:
         """The connection table a workbook cell names, or ``None`` if unknown."""
-        return {"source": self.source, "target": self.target}.get(name.strip().casefold())
+        known = dict(self.connections) or {"source": self.source, "target": self.target}
+        return known.get(name.strip().casefold())
+
+    def section_names(self) -> tuple[str, ...]:
+        """Every connection name this profile defines, for error messages."""
+        known = dict(self.connections) or {"source": self.source, "target": self.target}
+        return tuple(sorted(known))
 
     @classmethod
     def empty(cls) -> RunProfile:
-        return cls(source=ConnectionProfile(), target=ConnectionProfile())
+        source, target = ConnectionProfile(), ConnectionProfile()
+        return cls(
+            source=source,
+            target=target,
+            connections={"source": source, "target": target},
+        )
 
 
 def load_profile(path: str | Path) -> RunProfile:
@@ -154,6 +175,38 @@ def load_profile(path: str | Path) -> RunProfile:
     except tomllib.TOMLDecodeError as exc:
         raise ReconciliationError(f"'{profile_path}' is not valid TOML: {exc}") from None
     return parse_profile(document, source=str(profile_path))
+
+
+def _named_connections(document: dict[str, Any], source: str) -> dict[str, ConnectionProfile]:
+    """Read ``[connections.<name>]``, if the profile defines any.
+
+    A workbook that reconciles against more than two databases names them, and
+    the profile answers with a table per name. Nothing here is special-cased:
+    ``source`` and ``target`` are simply the two names every profile already
+    has, so a file that defines neither section behaves exactly as before.
+    """
+    raw = document.get("connections")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ReconciliationError(f"{source}: [connections] must be a table of named tables.")
+
+    named: dict[str, ConnectionProfile] = {}
+    for key, table in raw.items():
+        name = str(key).strip().casefold()
+        where = f"[connections.{key}]"
+        if not name:
+            raise ReconciliationError(f"{source}: {where} has an empty connection name.")
+        if name in _ALIAS_SECTIONS:
+            raise ReconciliationError(
+                f"{source}: {where} collides with the [{name}] section. Use one or the "
+                f"other, so a workbook cell saying '{name}' has a single meaning."
+            )
+        if not isinstance(table, dict):
+            raise ReconciliationError(f"{source}: {where} must be a table.")
+        _reject_unknown(table, _ALLOWED_SOURCE_KEYS, source, where=where)
+        named[name] = _connection(table, source, where)
+    return named
 
 
 def parse_profile(document: dict[str, Any], *, source: str = "<profile>") -> RunProfile:
@@ -181,6 +234,8 @@ def parse_profile(document: dict[str, Any], *, source: str = "<profile>") -> Run
 
     source_profile = _connection(source_table, source, "[source]")
     target_profile = _connection(target_table, source, "[target]")
+
+    named = _named_connections(document, source)
 
     warnings: list[str] = []
     target_inherited = False
@@ -223,6 +278,10 @@ def parse_profile(document: dict[str, Any], *, source: str = "<profile>") -> Run
     return RunProfile(
         source=source_profile,
         target=target_profile,
+        # The two original sections are names like any other, so a lookup never
+        # has to know whether a profile spelled a connection [source] or
+        # [connections.source].
+        connections={"source": source_profile, "target": target_profile, **named},
         workbook_path=Path(workbook_path).expanduser() if workbook_path else None,
         sheet_name=sheet_name,
         schema_path=Path(schema_path).expanduser() if schema_path else None,

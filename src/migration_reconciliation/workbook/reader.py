@@ -294,7 +294,7 @@ def _build_test_case(
     return TestCase(
         test_case_id=test_case_id,
         row_number=row_number,
-        source_type=DatabaseType(values["source_type"]),
+        source_type=(DatabaseType(values["source_type"]) if values.get("source_type") else None),
         source_connection=str(values["source_connection"]),
         target_connection=str(values["target_connection"]),
         source_sql=str(values["source_sql"]),

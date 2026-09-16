@@ -47,6 +47,26 @@ class LiveExecutorFactory:
             QuerySide.SOURCE: build_executor(source, driver=source_driver),
             QuerySide.TARGET: build_executor(target, driver=target_driver),
         }
+        # Connections are addressed by name. "source" and "target" are simply
+        # the two names every profile already defines, which is what keeps
+        # existing workbooks and profiles working unchanged.
+        self._by_name: dict[str, QuerySide] = {
+            "source": QuerySide.SOURCE,
+            "target": QuerySide.TARGET,
+        }
+
+    def _resolve(self, connection_name: str, side: QuerySide) -> QuerySide:
+        """Which configured connection a workbook cell means.
+
+        The name wins when the profile defines it. A name the profile does not
+        define falls back to the side's own connection, so a workbook using a
+        local label for the usual two sides still runs.
+        """
+        return self._by_name.get(connection_name.strip().casefold(), side)
+
+    def settings_by_name(self, connection_name: str, side: QuerySide) -> ConnectionSettings:
+        """The settings behind one connection name."""
+        return self._settings[self._resolve(connection_name, side)]
 
     def settings_for(self, side: QuerySide) -> ConnectionSettings:
         return self._settings[side]
@@ -86,15 +106,24 @@ class LiveExecutorFactory:
         Server, where a query valid in both dialects passes a check that
         proved nothing about the database it will actually run on.
         """
-        configured = self._settings[side].database_type
+        resolved = self._resolve(connection_name, side)
+        configured = self._settings[resolved].database_type
         if database_type is not configured:
             raise ReconciliationError(
-                f"Test '{test_case_id}' expects the {side.value} database to be "
-                f"{database_type.value}, but the profile configures {side.value} as "
-                f"{configured.value}. Point [{side.value}] at a {database_type.value} "
+                f"Test '{test_case_id}' expects connection '{connection_name}' to be "
+                f"{database_type.value}, but the profile configures it as "
+                f"{configured.value}. Point that connection at a {database_type.value} "
                 f"database, or correct the workbook."
             )
-        return self._executors[side]
+        return self._executors[resolved]
+
+    def engine_of(self, connection_name: str, side: QuerySide) -> DatabaseType:
+        """The engine a named connection actually speaks.
+
+        Asked of the connection rather than taken from a workbook constant, so
+        a dialect check reflects the database a query will really meet.
+        """
+        return self._settings[self._resolve(connection_name, side)].database_type
 
     def close_all(self) -> None:
         """Close both connections. One failing close never skips the other."""

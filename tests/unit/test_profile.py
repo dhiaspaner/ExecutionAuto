@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -347,3 +348,62 @@ def test_a_client_directory_without_thick_mode_is_rejected() -> None:
 
     with pytest.raises(ReconciliationError, match="only used in thick mode"):
         parse_profile(doc)
+
+
+# ---------------------------------------------------------------------------
+# Named connections: a workbook may reconcile across more than two databases.
+# ---------------------------------------------------------------------------
+
+
+def test_named_connections_are_parsed_alongside_source_and_target() -> None:
+    profile = parse_profile(
+        document(
+            connections={
+                "oracle_mol": {
+                    "type": "oracle",
+                    "server": "oracle-host",
+                    "database": "MOL",
+                    "authentication": "password",
+                    "username": "migration_reader",
+                }
+            }
+        )
+    )
+
+    assert profile.section_names() == ("oracle_mol", "source", "target")
+    named = profile.section("oracle_mol")
+    assert named is not None
+    assert named.database_type is DatabaseType.ORACLE
+
+
+def test_source_and_target_remain_addressable_by_name() -> None:
+    """Existing workbooks name "source" and "target"; that must keep working."""
+    profile = parse_profile(document())
+
+    assert profile.section("source") is profile.source
+    assert profile.section("target") is profile.target
+    assert profile.section("SOURCE") is profile.source
+
+
+def test_a_named_connection_cannot_shadow_a_section() -> None:
+    """Two meanings for one name would make a workbook cell ambiguous."""
+    with pytest.raises(ReconciliationError, match="collides with the \[source\] section"):
+        parse_profile(document(connections={"source": {"type": "oracle", "server": "h"}}))
+
+
+def test_an_unknown_key_in_a_named_connection_is_rejected() -> None:
+    with pytest.raises(ReconciliationError, match=re.escape("[connections.legacy]")):
+        parse_profile(document(connections={"legacy": {"typo": "oracle"}}))
+
+
+def test_a_secret_under_a_named_connection_is_still_refused() -> None:
+    """The credential scan walks the whole tree, so new tables are covered."""
+    with pytest.raises(ReconciliationError):
+        parse_profile(document(connections={"legacy": {"type": "oracle", "password": "hunter2"}}))
+
+
+def test_a_profile_with_no_connections_table_behaves_as_before() -> None:
+    profile = parse_profile(document())
+
+    assert profile.section_names() == ("source", "target")
+    assert profile.section("nope") is None
