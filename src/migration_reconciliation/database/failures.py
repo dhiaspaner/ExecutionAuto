@@ -13,6 +13,8 @@ short tail of them.
 
 from __future__ import annotations
 
+import sys
+from collections.abc import Mapping
 from enum import StrEnum
 
 from ..security.redaction import sanitize_error
@@ -23,6 +25,7 @@ __all__ = [
     "classify_failure",
     "connection_failure_message",
     "describe_object_access_failure",
+    "driver_load_failure_message",
     "is_timeout_failure",
 ]
 
@@ -91,6 +94,52 @@ _ADVICE: dict[FailureCause, str] = {
     ),
     FailureCause.UNKNOWN: "the driver rejected the connection",
 }
+
+
+#: How to supply the ODBC driver manager ``pyodbc`` links against. Windows has
+#: one built in, so only the Unixes need a package installed.
+_UNIXODBC_ADVICE: Mapping[str, str] = {
+    "darwin": (
+        "Install unixODBC with 'brew install unixodbc', then rebuild the binding against "
+        "it with 'uv sync --reinstall-package pyodbc'."
+    ),
+    "linux": (
+        "Install unixODBC with your package manager ('apt install unixodbc' or "
+        "'yum install unixODBC'), then rebuild the binding against it with "
+        "'uv sync --reinstall-package pyodbc'."
+    ),
+}
+
+_REINSTALL_ADVICE = "Reinstall it with 'uv sync --reinstall-package {module}'."
+
+
+def driver_load_failure_message(exc: ImportError, *, module: str, engine: str) -> str:
+    """Explain why a database binding could not be imported, and what to do about it.
+
+    The two causes need opposite actions, and telling them apart matters:
+
+    *Not installed* — the package is absent. Installing it is the fix.
+
+    *Installed but unloadable* — the package is there and its native library is
+    not, which is what a fresh ``pyodbc`` on a machine without unixODBC looks
+    like. Telling someone to install a package they already have sends them
+    round a loop that cannot end, so this case names the library instead.
+    """
+    if isinstance(exc, ModuleNotFoundError) and exc.name == module:
+        return (
+            f"{module} is not installed, so no {engine} connection can be opened. "
+            f"Install it with 'uv sync' (or 'uv add {module}'). ({exc})"
+        )
+    advice = (
+        _UNIXODBC_ADVICE.get(sys.platform, _REINSTALL_ADVICE.format(module=module))
+        if module == "pyodbc"
+        else _REINSTALL_ADVICE.format(module=module)
+    )
+    return (
+        f"{module} is installed but its native library could not be loaded, so no "
+        f"{engine} connection can be opened. {advice} "
+        f"Driver reported: {sanitize_error(exc, max_length=300)}"
+    )
 
 
 def classify_failure(exc: BaseException) -> FailureCause:

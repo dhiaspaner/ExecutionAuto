@@ -45,6 +45,7 @@ from .failures import (
     FailureCause,
     classify_failure,
     connection_failure_message,
+    driver_load_failure_message,
     is_timeout_failure,
 )
 from .settings import ConnectionSettings
@@ -204,8 +205,7 @@ class OracleExecutor:
             import oracledb
         except ImportError as exc:
             raise DatabaseExecutionError(
-                "oracledb is not installed, so no Oracle connection can be opened. "
-                f"Install it with 'uv add oracledb'. ({exc})"
+                driver_load_failure_message(exc, module="oracledb", engine="Oracle")
             ) from None
         self._driver = oracledb
         return oracledb

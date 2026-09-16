@@ -33,6 +33,7 @@ from .failures import (
     FailureCause,
     classify_failure,
     connection_failure_message,
+    driver_load_failure_message,
     is_timeout_failure,
 )
 from .settings import ConnectionSettings
@@ -210,8 +211,7 @@ class SqlServerExecutor:
             import pyodbc
         except ImportError as exc:
             raise DatabaseExecutionError(
-                "pyodbc is not installed, so no SQL Server connection can be opened. "
-                f"Install it with 'uv add pyodbc'. ({exc})"
+                driver_load_failure_message(exc, module="pyodbc", engine="SQL Server")
             ) from None
         self._driver = pyodbc
         return pyodbc

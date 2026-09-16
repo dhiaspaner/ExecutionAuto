@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import sys
 from typing import Any
 
@@ -264,6 +265,34 @@ def test_a_missing_pyodbc_is_explained_rather_than_traced(monkeypatch: pytest.Mo
 
     with pytest.raises(DatabaseExecutionError, match="pyodbc is not installed"):
         executor.connect()
+
+
+def test_an_installed_pyodbc_that_will_not_load_is_not_called_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The package is there; its ODBC library is not. Telling someone to install
+    what they already have sends them round a loop that cannot end."""
+
+    def explode(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "pyodbc":
+            raise ImportError(
+                "dlopen(pyodbc.cpython-312-darwin.so): Library not loaded: libodbc.2.dylib",
+                name="pyodbc",
+            )
+        return original(name, *args, **kwargs)
+
+    original = builtins.__import__
+    monkeypatch.delitem(sys.modules, "pyodbc", raising=False)
+    monkeypatch.setattr(builtins, "__import__", explode)
+
+    with pytest.raises(DatabaseExecutionError) as raised:
+        SqlServerExecutor(settings()).connect()
+
+    message = str(raised.value)
+    assert "is installed but its native library could not be loaded" in message
+    assert "not installed" not in message
+    assert "unixODBC" in message or "reinstall-package" in message
+    assert "libodbc" in message
 
 
 # -- validating SQL without executing it --------------------------------------

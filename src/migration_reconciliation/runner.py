@@ -13,7 +13,7 @@ on — unless ``--fail-fast`` was requested.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -35,8 +35,8 @@ from .models import (
 )
 from .security.redaction import sanitize_error, sanitize_text
 from .security.sql_guard import assert_read_only
-from .workbook.reader import InvalidRow, SkippedRow, read_workbook
-from .workbook.writer import write_results
+from .workbook.reader import InvalidRow, SkippedRow, WorkbookRead, read_workbook
+from .workbook.writer import ResultWorkbook
 
 __all__ = ["ReconciliationRunner", "RunOptions", "new_run_id"]
 
@@ -59,11 +59,15 @@ class RunOptions:
     """Everything the CLI can vary about a run."""
 
     case_ids: tuple[str, ...] = ()
+    from_case: str | None = None
+    to_case: str | None = None
     limit: int | None = None
     fail_fast: bool = False
     output_dir: Path | None = None
     write_output: bool = True
     run_id: str = field(default_factory=new_run_id)
+    #: Receives progress notes about the result workbook, e.g. to print them.
+    notify: Callable[[str], None] | None = None
 
 
 class ReconciliationRunner:
@@ -80,7 +84,7 @@ class ReconciliationRunner:
         started_at = datetime.now(UTC).replace(microsecond=0)
 
         read = read_workbook(path, self._schema)
-        selected, deselected = _select(read.test_cases, opts)
+        selected, deselected = _select(read, opts)
 
         results: list[ExecutionResult] = [
             self._workbook_error_result(invalid, opts.run_id, started_at)
@@ -89,41 +93,57 @@ class ReconciliationRunner:
         results.extend(
             self._skipped_result(skipped, opts.run_id, started_at) for skipped in read.skipped
         )
-
-        stopped_early = False
-        try:
-            for case in selected:
-                if stopped_early:
-                    halted = SkippedRow(
-                        case.row_number, case.test_case_id, "Stopped by --fail-fast"
-                    )
-                    results.append(self._skipped_result(halted, opts.run_id, started_at))
-                    continue
-                result = self.execute_case(case, opts.run_id)
-                results.append(result)
-                if opts.fail_fast and result.status is not ExecutionStatus.PASS:
-                    stopped_early = True
-        finally:
-            self._factory.close_all()
-
         results.extend(
             self._skipped_result(
                 SkippedRow(case.row_number, case.test_case_id, reason), opts.run_id, started_at
             )
             for case, reason in deselected
         )
-        results.sort(key=lambda r: r.row_number)
 
+        result_book: ResultWorkbook | None = None
         output_path: Path | None = None
-        if opts.write_output:
-            output_path = write_results(
-                path,
-                self._schema,
-                results,
-                run_id=opts.run_id,
-                timestamp=started_at,
-                output_dir=opts.output_dir,
-            )
+        try:
+            try:
+                if opts.write_output:
+                    # Created before the first query, so a bad output directory
+                    # fails now, and the file can be watched while cases run.
+                    result_book = ResultWorkbook(
+                        path,
+                        self._schema,
+                        run_id=opts.run_id,
+                        timestamp=started_at,
+                        output_dir=opts.output_dir,
+                    )
+                    result_book.write(results)
+                    output_path = result_book.save()
+                    _notify(opts, f"Result workbook (updated after every case): {output_path}")
+
+                stopped_early = False
+                save_failing = False
+                for case in selected:
+                    if stopped_early:
+                        halted = SkippedRow(
+                            case.row_number, case.test_case_id, "Stopped by --fail-fast"
+                        )
+                        results.append(self._skipped_result(halted, opts.run_id, started_at))
+                        continue
+                    result = self.execute_case(case, opts.run_id)
+                    results.append(result)
+                    if result_book is not None:
+                        result_book.write((result,))
+                        save_failing = _save_progress(result_book, opts, save_failing)
+                    if opts.fail_fast and result.status is not ExecutionStatus.PASS:
+                        stopped_early = True
+            finally:
+                self._factory.close_all()
+
+            results.sort(key=lambda r: r.row_number)
+            if result_book is not None:
+                result_book.write(results)
+                output_path = _save_final(result_book, opts)
+        finally:
+            if result_book is not None:
+                result_book.close()
 
         return RunSummary(
             run_id=opts.run_id,
@@ -263,11 +283,31 @@ class ReconciliationRunner:
 
 
 def _select(
-    cases: Sequence[TestCase], options: RunOptions
+    read: WorkbookRead, options: RunOptions
 ) -> tuple[list[TestCase], list[tuple[TestCase, str]]]:
     """Split enabled cases into those to run and those excluded by the options."""
-    selected = list(cases)
+    selected = list(read.test_cases)
     deselected: list[tuple[TestCase, str]] = []
+
+    if options.from_case is not None or options.to_case is not None:
+        if options.case_ids:
+            raise WorkbookError("--case cannot be combined with --from-case or --to-case")
+        first = _boundary_row(read, options.from_case, "--from-case")
+        last = _boundary_row(read, options.to_case, "--to-case")
+        if first is not None and last is not None and first > last:
+            raise WorkbookError(
+                f"--from-case {options.from_case} comes after --to-case {options.to_case} "
+                f"in the workbook"
+            )
+        in_range: list[TestCase] = []
+        for case in selected:
+            if (first is None or case.row_number >= first) and (
+                last is None or case.row_number <= last
+            ):
+                in_range.append(case)
+            else:
+                deselected.append((case, "Outside --from-case/--to-case range"))
+        selected = in_range
 
     if options.case_ids:
         wanted = {c.casefold() for c in options.case_ids}
@@ -293,6 +333,57 @@ def _select(
         selected = selected[: options.limit]
 
     return selected, deselected
+
+
+def _boundary_row(read: WorkbookRead, case_id: str | None, flag: str) -> int | None:
+    """Row number of a range boundary. Disabled and invalid rows count as anchors too."""
+    if case_id is None:
+        return None
+    wanted = case_id.casefold()
+    rows = [
+        *((c.row_number, c.test_case_id) for c in read.test_cases),
+        *((r.row_number, r.test_case_id) for r in read.skipped),
+        *((r.row_number, r.test_case_id) for r in read.invalid),
+    ]
+    for row_number, test_case_id in rows:
+        if test_case_id.casefold() == wanted:
+            return row_number
+    raise WorkbookError(f"No test case matches {flag} {case_id}. Check the id.")
+
+
+def _notify(options: RunOptions, message: str) -> None:
+    if options.notify is not None:
+        options.notify(message)
+
+
+def _save_progress(result_book: ResultWorkbook, options: RunOptions, was_failing: bool) -> bool:
+    """Save after one case. A failed save never stops the run; it is retried next case.
+
+    Returns whether saving is currently failing, so the note is shown once
+    rather than after every case.
+    """
+    try:
+        result_book.save()
+    except WorkbookError as exc:
+        if not was_failing:
+            _notify(
+                options,
+                f"Could not update the result workbook ({exc}). Is it open in Excel? "
+                f"Retrying after each case; results are kept in memory.",
+            )
+        return True
+    if was_failing:
+        _notify(options, "Result workbook is being updated again.")
+    return False
+
+
+def _save_final(result_book: ResultWorkbook, options: RunOptions) -> Path:
+    """The last save. If the file cannot be replaced, the results go to a new file."""
+    try:
+        return result_book.save()
+    except WorkbookError as exc:
+        _notify(options, f"Could not update the result workbook ({exc}). Saving a new copy.")
+        return result_book.save_to_new_file()
 
 
 def _error_code(exc: BaseException, expected: str) -> str:

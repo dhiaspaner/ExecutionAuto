@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import sys
 from typing import Any
 
@@ -461,3 +462,23 @@ def test_the_password_never_reaches_a_validation_failure() -> None:
         executor.validate_syntax("SELECT 1 FROM DUAL", 30)
 
     assert SECRET not in str(raised.value)
+
+
+def test_an_installed_oracledb_that_will_not_load_is_not_called_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def explode(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "oracledb":
+            raise ImportError("libclntsh.dylib could not be loaded", name="oracledb")
+        return original(name, *args, **kwargs)
+
+    original = builtins.__import__
+    monkeypatch.delitem(sys.modules, "oracledb", raising=False)
+    monkeypatch.setattr(builtins, "__import__", explode)
+
+    with pytest.raises(DatabaseExecutionError) as raised:
+        OracleExecutor(settings()).connect()
+
+    message = str(raised.value)
+    assert "is installed but its native library could not be loaded" in message
+    assert "reinstall-package oracledb" in message

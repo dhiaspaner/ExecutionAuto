@@ -398,12 +398,23 @@ uv run reconcile execute ".\templates\reconciliation_template.xlsx" `
     --limit 2 `
     --fake-results ".\tests\fixtures\fake_results.toml"
 
+# A slice from the middle: TC-PAY-003 through TC-PAY-006, inclusive, in workbook order
+uv run reconcile execute ".\templates\reconciliation_template.xlsx" `
+    --schema ".\config\workbook_schema.example.toml" `
+    --from-case "TC-PAY-003" --to-case "TC-PAY-006" `
+    --fake-results ".\tests\fixtures\fake_results.toml"
+
 # Stop at the first problem, and put the output somewhere specific
 uv run reconcile execute ".\templates\reconciliation_template.xlsx" `
     --schema ".\config\workbook_schema.example.toml" `
     --fail-fast --output-dir ".\out" `
     --fake-results ".\tests\fixtures\fake_results.toml"
 ```
+
+`--from-case` and `--to-case` pick an inclusive slice by test-case id, in workbook
+row order. Either may be given alone (run from a case to the end, or from the
+start up to a case), a disabled row can serve as a boundary, and `--limit` is
+applied after the slice. They cannot be combined with `--case`.
 
 `--output-dir` must already exist — create it once with `mkdir out`.
 
@@ -413,6 +424,18 @@ Each run writes `<input stem>_results_<yyyymmdd_hhmmss>.xlsx` next to the input,
 or into `--output-dir`. An existing file is never overwritten: if two runs land
 in the same second, the second filename also carries the run id
 (`..._results_20260912_104504_fa24b2a748ee.xlsx`).
+
+The result workbook is created before the first query runs and saved again after
+every case, so you can follow a long run while it is going, and a run stopped
+with Ctrl+C keeps every case that had already finished. Cases still waiting have
+empty result cells. Each save replaces the file in one step, so it is never left
+half-written.
+
+On Windows, Excel locks a workbook it has open, so the file cannot be updated
+while you have it open. The run carries on, keeps the results in memory, and
+tries again after the next case. If the file is still locked at the end, the
+full results are saved to a new file (`..._2.xlsx`) and its name is printed. To
+follow progress without blocking updates, open a copy of the file.
 
 ### Exit codes
 
@@ -714,17 +737,18 @@ Run 11e39e7daf1b - payments_demo.xlsx
 
 ### Repeat runs
 
-Four optional flags exist, because they change *what runs* rather than supply
+Six optional flags exist, because they change *what runs* rather than supply
 information the script needs:
 
 ```powershell
 uv run python run_reconciliation.py --case TC-PAY-008
 uv run python run_reconciliation.py --limit 2
+uv run python run_reconciliation.py --from-case TC-PAY-003 --to-case TC-PAY-006
 uv run python run_reconciliation.py --output-dir .\out
 uv run python run_reconciliation.py --profile .\config\my_profile.toml --limit 2
 ```
 
-Those four are the only flags. There is deliberately no `--source-server`, no
+Those six are the only flags. There is deliberately no `--source-server`, no
 `--sheet-name` and no `--password`: connection details are typed in or come from
 a profile, and a password is only ever typed at a hidden prompt.
 

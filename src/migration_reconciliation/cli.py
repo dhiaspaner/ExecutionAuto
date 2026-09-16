@@ -108,6 +108,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run only this test case id. Repeatable.",
     )
     execute.add_argument(
+        "--from-case",
+        metavar="ID",
+        help="Start at this test case id (inclusive, workbook order).",
+    )
+    execute.add_argument(
+        "--to-case",
+        metavar="ID",
+        help="Stop at this test case id (inclusive, workbook order).",
+    )
+    execute.add_argument(
         "--limit", type=int, metavar="N", help="Run at most N test cases (pilot run)."
     )
     execute.add_argument(
@@ -265,10 +275,13 @@ def _cmd_execute(args: argparse.Namespace) -> int:
     _emit(f"Offline run - scripted results from {args.fake_results}")
     options = RunOptions(
         case_ids=tuple(args.cases),
+        from_case=args.from_case,
+        to_case=args.to_case,
         limit=args.limit,
         fail_fast=args.fail_fast,
         output_dir=args.output_dir,
         write_output=not args.no_write,
+        notify=lambda message: _emit(f"  {message}"),
     )
     summary = ReconciliationRunner(schema, factory).run(args.workbook, options)
     _report(summary)

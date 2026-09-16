@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
+from openpyxl import load_workbook
 
 from migration_reconciliation.database.base import QuerySide
 from migration_reconciliation.database.factory import FakeExecutorFactory
@@ -323,6 +326,103 @@ def test_negative_limit_is_rejected(
         _run(schema, path, book, limit=-1)
 
 
+def _five_cases(make_workbook: Any, case_row: Any, make_results: Any) -> tuple[Path, Any]:
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 6)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 6)
+        ]
+    )
+    return path, book
+
+
+def test_from_and_to_case_run_a_slice_from_the_middle(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path, book = _five_cases(make_workbook, case_row, make_results)
+
+    summary, factory = _run(schema, path, book, from_case="TC-002", to_case="tc-004")
+
+    assert summary.passed == 3
+    assert summary.skipped == 2
+    assert _by_id(summary)["TC-005"].remarks == "Outside --from-case/--to-case range"
+    assert {e.test_case_id for e in factory.created} == {"TC-002", "TC-003", "TC-004"}
+
+
+def test_from_case_alone_runs_to_the_end(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path, book = _five_cases(make_workbook, case_row, make_results)
+
+    _, factory = _run(schema, path, book, from_case="TC-004")
+
+    assert {e.test_case_id for e in factory.created} == {"TC-004", "TC-005"}
+
+
+def test_to_case_alone_runs_from_the_start(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path, book = _five_cases(make_workbook, case_row, make_results)
+
+    _, factory = _run(schema, path, book, to_case="TC-002")
+
+    assert {e.test_case_id for e in factory.created} == {"TC-001", "TC-002"}
+
+
+def test_range_is_applied_before_limit(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path, book = _five_cases(make_workbook, case_row, make_results)
+
+    _, factory = _run(schema, path, book, from_case="TC-003", limit=1)
+
+    assert {e.test_case_id for e in factory.created} == {"TC-003"}
+
+
+def test_disabled_case_can_be_a_range_boundary(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path = make_workbook(
+        [case_row("TC-001"), case_row("TC-002", enabled=False), case_row("TC-003")]
+    )
+    book = make_results(
+        {"test_case_id": "TC-001", "source_result": 1, "target_result": 1},
+        {"test_case_id": "TC-003", "source_result": 1, "target_result": 1},
+    )
+
+    _, factory = _run(schema, path, book, from_case="TC-002")
+
+    assert {e.test_case_id for e in factory.created} == {"TC-003"}
+
+
+def test_unknown_range_boundary_is_an_error(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path, book = _five_cases(make_workbook, case_row, make_results)
+
+    with pytest.raises(WorkbookError, match="No test case matches --to-case TC-NOPE"):
+        _run(schema, path, book, to_case="TC-NOPE")
+
+
+def test_reversed_range_is_an_error(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path, book = _five_cases(make_workbook, case_row, make_results)
+
+    with pytest.raises(WorkbookError, match="comes after"):
+        _run(schema, path, book, from_case="TC-004", to_case="TC-002")
+
+
+def test_range_cannot_be_combined_with_case(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any
+) -> None:
+    path, book = _five_cases(make_workbook, case_row, make_results)
+
+    with pytest.raises(WorkbookError, match="cannot be combined"):
+        _run(schema, path, book, case_ids=("TC-001",), from_case="TC-002")
+
+
 def test_fail_fast_stops_after_the_first_problem(
     make_workbook: Any, case_row: Any, schema: Any, make_results: Any
 ) -> None:
@@ -433,3 +533,129 @@ def test_multi_row_result_is_rejected_as_an_error(
     assert result.status is ExecutionStatus.ERROR
     assert result.error_side is ErrorSide.SOURCE
     assert "25 rows" in result.remarks
+
+
+# -- progressive result workbook ---------------------------------------------
+
+
+def _statuses(output: Path, schema: Any) -> dict[int, Any]:
+    """Status cell of every data row in a saved result workbook, by row number."""
+    workbook = load_workbook(output)
+    try:
+        sheet = workbook[schema.sheet_name]
+        wanted = schema.fields["status"].header
+        column = next(c.column for c in sheet[schema.header_row] if c.value == wanted)
+        return {
+            row: sheet.cell(row=row, column=column).value
+            for row in range(schema.first_data_row, sheet.max_row + 1)
+        }
+    finally:
+        workbook.close()
+
+
+class _WatchingFactory(FakeExecutorFactory):
+    """Calls ``on_case`` just before a case's source query is handed out."""
+
+    def __init__(self, book: Any, on_case: Callable[[str], None]) -> None:
+        super().__init__(book)
+        self._on_case = on_case
+
+    def get_executor(self, **kwargs: Any) -> Any:
+        if kwargs["side"] is QuerySide.SOURCE:
+            self._on_case(kwargs["test_case_id"])
+        return super().get_executor(**kwargs)
+
+
+def _three_cases(make_workbook: Any, case_row: Any, make_results: Any) -> tuple[Path, Any]:
+    path = make_workbook([case_row(f"TC-{i:03d}") for i in range(1, 4)])
+    book = make_results(
+        *[
+            {"test_case_id": f"TC-{i:03d}", "source_result": 1, "target_result": 1}
+            for i in range(1, 4)
+        ]
+    )
+    return path, book
+
+
+def test_result_workbook_is_updated_after_every_case(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Path
+) -> None:
+    path, book = _three_cases(make_workbook, case_row, make_results)
+    seen: dict[str, dict[int, Any]] = {}
+    notes: list[str] = []
+
+    def snapshot(test_case_id: str) -> None:
+        (output,) = tmp_path.glob("*_results_*.xlsx")
+        seen[test_case_id] = _statuses(output, schema)
+
+    runner = ReconciliationRunner(schema, _WatchingFactory(book, snapshot))
+    summary = runner.run(path, RunOptions(notify=notes.append))
+
+    assert seen["TC-001"] == {2: None, 3: None, 4: None}, "created before the first query"
+    assert seen["TC-002"] == {2: "PASS", 3: None, 4: None}
+    assert seen["TC-003"] == {2: "PASS", 3: "PASS", 4: None}
+    assert summary.output_path is not None
+    assert _statuses(summary.output_path, schema) == {2: "PASS", 3: "PASS", 4: "PASS"}
+    assert any(str(summary.output_path) in note for note in notes)
+
+
+def test_interrupted_run_keeps_the_cases_that_finished(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Path
+) -> None:
+    path, book = _three_cases(make_workbook, case_row, make_results)
+
+    def interrupt(test_case_id: str) -> None:
+        if test_case_id == "TC-003":
+            raise KeyboardInterrupt
+
+    factory = _WatchingFactory(book, interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        ReconciliationRunner(schema, factory).run(path, RunOptions())
+
+    (output,) = tmp_path.glob("*_results_*.xlsx")
+    assert _statuses(output, schema) == {2: "PASS", 3: "PASS", 4: None}
+    assert list(tmp_path.glob("*.tmp")) == [], "no temporary file may be left behind"
+    assert all(executor.closed for executor in factory.created)
+
+
+def test_a_locked_result_workbook_does_not_stop_the_run(
+    make_workbook: Any,
+    case_row: Any,
+    schema: Any,
+    make_results: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Excel on Windows locks an open workbook, so replacing it fails."""
+    path, book = _three_cases(make_workbook, case_row, make_results)
+    real_replace = os.replace
+
+    def locked_once_created(source: Any, destination: Any) -> None:
+        if Path(destination).exists():
+            Path(source).unlink()
+            raise PermissionError(13, "Permission denied")
+        real_replace(source, destination)
+
+    monkeypatch.setattr("migration_reconciliation.workbook.writer.os.replace", locked_once_created)
+    notes: list[str] = []
+
+    summary, _ = _run(schema, path, book, notify=notes.append)
+
+    assert summary.passed == 3
+    assert summary.output_path is not None
+    assert summary.output_path.stem.endswith("_2")
+    assert _statuses(summary.output_path, schema) == {2: "PASS", 3: "PASS", 4: "PASS"}
+    assert sum("Is it open in Excel?" in note for note in notes) == 1
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_missing_output_directory_fails_before_any_query(
+    make_workbook: Any, case_row: Any, schema: Any, make_results: Any, tmp_path: Path
+) -> None:
+    path, book = _three_cases(make_workbook, case_row, make_results)
+    factory = FakeExecutorFactory(book)
+
+    with pytest.raises(WorkbookError, match="Output directory does not exist"):
+        ReconciliationRunner(schema, factory).run(path, RunOptions(output_dir=tmp_path / "missing"))
+
+    assert factory.created == ()

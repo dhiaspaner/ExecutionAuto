@@ -12,11 +12,13 @@ password: connection details are typed in, used for the life of the run, and
 never stored. Passwords are read with :func:`getpass.getpass`, never echoed,
 never logged, and never written to the result workbook.
 
-Three optional flags exist, all of them execution modifiers rather than
+Optional flags exist, all of them execution modifiers rather than
 information the script needs to run:
 
 ``--profile FILE``   a TOML file that pre-answers the questions (never a password)
 ``--case ID``        run only this test case; repeatable
+``--from-case ID``   start at this test case (inclusive, workbook order)
+``--to-case ID``     stop at this test case (inclusive, workbook order)
 ``--limit N``        run at most N cases, for a pilot
 ``--output-dir DIR`` where to put the result workbook
 
@@ -87,6 +89,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run only this test case id. Repeatable.",
     )
     parser.add_argument(
+        "--from-case",
+        metavar="ID",
+        help="Start at this test case id (inclusive, workbook order).",
+    )
+    parser.add_argument(
+        "--to-case",
+        metavar="ID",
+        help="Stop at this test case id (inclusive, workbook order).",
+    )
+    parser.add_argument(
         "--limit", type=int, metavar="N", help="Run at most N test cases (pilot run)."
     )
     parser.add_argument(
@@ -108,7 +120,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_USAGE
     except KeyboardInterrupt:
         print("")
-        _error("Interrupted. Nothing was written.")
+        _error(
+            "Interrupted. Cases that finished before Ctrl+C are already in the result "
+            "workbook, if one was created."
+        )
         return EXIT_INTERRUPTED
     except Exception as exc:  # never let a raw driver message reach the console
         _error(sanitize_error(exc))
@@ -141,9 +156,12 @@ def _run(args: argparse.Namespace) -> int:
         _emit("Executing...")
         options = RunOptions(
             case_ids=tuple(args.cases),
+            from_case=args.from_case,
+            to_case=args.to_case,
             limit=args.limit,
             output_dir=args.output_dir,
             write_output=True,
+            notify=lambda message: _emit(f"  {message}"),
         )
         summary = ReconciliationRunner(schema, factory).run(answers.workbook_path, options)
     finally:

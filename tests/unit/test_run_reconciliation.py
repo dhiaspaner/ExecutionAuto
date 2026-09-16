@@ -244,6 +244,17 @@ def test_limit_runs_a_pilot(
     assert "2 passed, 0 failed, 0 errors, 1 skipped" in capsys.readouterr().out
 
 
+def test_from_and_to_case_run_a_slice(
+    workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    console.script(answers_for(workbook))
+    use_drivers(monkeypatch, FakePyodbc(), FakePyodbc())
+
+    run_reconciliation.main(["--from-case", "TC-002", "--to-case", "TC-002"])
+
+    assert "1 passed, 0 failed, 0 errors, 2 skipped" in capsys.readouterr().out
+
+
 def test_output_dir_places_the_result_workbook(
     workbook: Path, console: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -262,7 +273,15 @@ def test_no_password_flag_exists() -> None:
     parser = run_reconciliation.build_parser()
     flags = {action.option_strings[0] for action in parser._actions if action.option_strings}
 
-    assert flags == {"-h", "--profile", "--case", "--limit", "--output-dir"}
+    assert flags == {
+        "-h",
+        "--profile",
+        "--case",
+        "--from-case",
+        "--to-case",
+        "--limit",
+        "--output-dir",
+    }
     assert not any("password" in flag for flag in flags)
     assert not any("server" in flag or "user" in flag for flag in flags)
 

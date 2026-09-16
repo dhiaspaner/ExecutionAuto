@@ -13,11 +13,19 @@ Three guarantees this module enforces:
 Status and variance are computed in Python and written as literal values, so a
 result workbook is correct the moment it is produced, with no dependence on
 Excel recalculating anything.
+
+A run keeps one :class:`ResultWorkbook` open and saves it again after every
+case, so the file grows while the run is still going. Each save goes to a
+temporary file that then replaces the result, so an interrupted run leaves the
+last complete save — never a half-written workbook.
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
+import tempfile
 from collections.abc import Iterable, Mapping
 from datetime import datetime
 from decimal import Decimal
@@ -35,7 +43,7 @@ from ..models import (
     WorkbookSchema,
 )
 
-__all__ = ["TIMESTAMP_FORMAT", "build_output_path", "write_results"]
+__all__ = ["TIMESTAMP_FORMAT", "ResultWorkbook", "build_output_path", "write_results"]
 
 #: Sortable, filename-safe, and identical on Windows and POSIX.
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
@@ -75,54 +83,123 @@ def write_results(
     output_dir: str | Path | None = None,
 ) -> Path:
     """Write ``results`` into a fresh copy of the workbook and return its path."""
-    source_path = Path(input_path).resolve()
-    if not source_path.is_file():
-        raise WorkbookError(f"Workbook not found: {source_path}")
-
-    directory = Path(output_dir).resolve() if output_dir is not None else None
-    output_path = build_output_path(
-        source_path, schema, timestamp=timestamp, run_id=run_id, output_dir=directory
+    result_workbook = ResultWorkbook(
+        input_path, schema, run_id=run_id, timestamp=timestamp, output_dir=output_dir
     )
+    try:
+        result_workbook.write(results)
+        return result_workbook.save()
+    finally:
+        result_workbook.close()
 
-    if output_path == source_path:
-        raise WorkbookError(
-            "Refusing to write results over the input workbook. Check "
-            "output_filename_pattern in the schema."
+
+class ResultWorkbook:
+    """A result copy of the workbook, held open for a run and saved as it fills.
+
+    The output path is chosen, and the sheet and result columns checked, when
+    this is created — before any query runs. The first :meth:`save` refuses to
+    replace a file that already exists; later saves replace only this run's own
+    result file.
+    """
+
+    def __init__(
+        self,
+        input_path: str | Path,
+        schema: WorkbookSchema,
+        *,
+        run_id: str,
+        timestamp: datetime,
+        output_dir: str | Path | None = None,
+    ) -> None:
+        self._schema = schema
+        self._run_id = run_id
+        self._saved = False
+
+        source_path = Path(input_path).resolve()
+        if not source_path.is_file():
+            raise WorkbookError(f"Workbook not found: {source_path}")
+
+        directory = Path(output_dir).resolve() if output_dir is not None else None
+        output_path = build_output_path(
+            source_path, schema, timestamp=timestamp, run_id=run_id, output_dir=directory
         )
-    if directory is not None and not directory.is_dir():
-        raise WorkbookError(f"Output directory does not exist: {directory}")
-    output_path = _resolve_free_path(output_path, run_id)
-
-    try:
-        workbook = load_workbook(source_path)
-    except Exception as exc:
-        raise WorkbookError(f"Cannot open workbook '{source_path.name}': {exc}") from None
-
-    try:
-        if schema.sheet_name not in workbook.sheetnames:
-            available = ", ".join(workbook.sheetnames) or "<none>"
+        if output_path == source_path:
             raise WorkbookError(
-                f"Sheet '{schema.sheet_name}' not found. Available sheets: {available}"
+                "Refusing to write results over the input workbook. Check "
+                "output_filename_pattern in the schema."
             )
-        sheet = workbook[schema.sheet_name]
-        column_map = _map_writable_columns(sheet, schema)
-
-        for result in results:
-            _write_row(sheet, schema, column_map, result)
-
-        if not schema.preserve_other_sheets:
-            for name in list(workbook.sheetnames):
-                if name != schema.sheet_name:
-                    del workbook[name]
+        if directory is not None and not directory.is_dir():
+            raise WorkbookError(f"Output directory does not exist: {directory}")
+        self.path = _resolve_free_path(output_path, run_id)
 
         try:
-            workbook.save(output_path)
-        except OSError as exc:
-            raise WorkbookError(f"Cannot write '{output_path}': {exc.strerror}") from None
-    finally:
-        workbook.close()
+            self._workbook = load_workbook(source_path)
+        except Exception as exc:
+            raise WorkbookError(f"Cannot open workbook '{source_path.name}': {exc}") from None
 
-    return output_path
+        try:
+            if schema.sheet_name not in self._workbook.sheetnames:
+                available = ", ".join(self._workbook.sheetnames) or "<none>"
+                raise WorkbookError(
+                    f"Sheet '{schema.sheet_name}' not found. Available sheets: {available}"
+                )
+            self._sheet = self._workbook[schema.sheet_name]
+            self._column_map = _map_writable_columns(self._sheet, schema)
+
+            if not schema.preserve_other_sheets:
+                for name in list(self._workbook.sheetnames):
+                    if name != schema.sheet_name:
+                        del self._workbook[name]
+        except BaseException:
+            self.close()
+            raise
+
+    def write(self, results: Iterable[ExecutionResult]) -> None:
+        """Put results into their rows. Nothing reaches disk until :meth:`save`."""
+        for result in results:
+            _write_row(self._sheet, self._schema, self._column_map, result)
+
+    def save(self) -> Path:
+        """Save everything written so far, atomically, and return the path."""
+        if not self._saved:
+            # Re-checked at the last moment: another run may have taken the name.
+            self.path = _resolve_free_path(self.path, self._run_id)
+        handle, temporary_name = tempfile.mkstemp(
+            prefix=f".{self.path.stem}.", suffix=".xlsx.tmp", dir=self.path.parent
+        )
+        os.close(handle)
+        temporary = Path(temporary_name)
+        try:
+            self._workbook.save(temporary)
+            # Same directory, so this is a rename: either the previous save or
+            # this one is in place, never a partial file.
+            os.replace(temporary, self.path)
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            raise WorkbookError(f"Cannot write '{self.path}': {exc.strerror}") from None
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        self._saved = True
+        return self.path
+
+    def save_to_new_file(self) -> Path:
+        """Save under a fresh name, for when this run's file cannot be replaced.
+
+        On Windows a result workbook opened in Excel is locked, so replacing it
+        fails. Losing a finished run over that would be the worst outcome.
+        """
+        self.path = _next_free_path(self.path)
+        self._saved = False
+        return self.save()
+
+    def close(self) -> None:
+        """Release the workbook. Safe to call more than once."""
+        workbook = getattr(self, "_workbook", None)
+        if workbook is not None:
+            # Cleanup must never mask the failure that triggered it.
+            with contextlib.suppress(Exception):
+                workbook.close()
 
 
 def _resolve_free_path(output_path: Path, run_id: str) -> Path:
@@ -141,6 +218,15 @@ def _resolve_free_path(output_path: Path, run_id: str) -> Path:
         if not candidate.exists():
             return candidate
     raise WorkbookError(f"Refusing to overwrite existing file: {output_path}")
+
+
+def _next_free_path(path: Path) -> Path:
+    """``name_2.xlsx``, ``name_3.xlsx``, ... — the first that does not exist."""
+    for number in range(2, 1000):
+        candidate = path.with_name(f"{path.stem}_{number}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise WorkbookError(f"Refusing to overwrite existing file: {path}")
 
 
 def _map_writable_columns(sheet: Any, schema: WorkbookSchema) -> dict[str, int]:
