@@ -436,6 +436,10 @@ def _optional_port(table: dict[str, Any], key: str, source: str, where: str) -> 
     if key not in table:
         return None
     value = table[key]
+    # TOML has no null, so an empty string is how a file says "no port"; it
+    # means exactly what leaving the key out means.
+    if isinstance(value, str) and not value.strip():
+        return None
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= MAX_PORT:
         raise ReconciliationError(
             f"{source}: {where} {key} must be a whole number between 1 and {MAX_PORT}"

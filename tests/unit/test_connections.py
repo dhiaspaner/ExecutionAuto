@@ -167,7 +167,7 @@ def test_a_missing_value_is_asked_for_one_question_at_a_time() -> None:
     settings = resolve_section_settings(partial, ["source"], prompter=answers.prompter())
 
     assert settings["source"].server == "sql01"
-    assert settings["source"].port == 1433  # Enter accepted the default
+    assert settings["source"].port is None  # Enter left it for the driver to detect
     assert settings["source"].database == "webservice"
     assert settings["source"].trust_server_certificate is True
 
@@ -252,3 +252,72 @@ def test_the_target_engine_is_whatever_the_profile_declares() -> None:
 
     assert profile.target.database_type is DatabaseType.ORACLE
     assert profile.target.auth_mode is AuthMode.PASSWORD
+
+
+# -- ports -------------------------------------------------------------------
+
+
+def _sqlserver_section(**extra: Any) -> Any:
+    section: dict[str, Any] = {
+        "type": "sqlserver",
+        "server": "HOST\\SQLEXPRESS",
+        "database": "webservice",
+        "authentication": "windows",
+        "trust_server_certificate": True,
+    }
+    section.update(extra)
+    return parse_profile({"version": "1.0", "source": section}, source="<test>")
+
+
+def test_a_sql_server_port_left_out_stays_unset_rather_than_becoming_1433() -> None:
+    settings = resolve_section_settings(_sqlserver_section(), ["source"], interactive=False)
+
+    # None is what makes the driver ask the SQL Browser for the instance's port.
+    assert settings["source"].port is None
+
+
+def test_an_empty_sql_server_port_means_the_same_as_leaving_it_out() -> None:
+    settings = resolve_section_settings(_sqlserver_section(port=""), ["source"], interactive=False)
+
+    assert settings["source"].port is None
+
+
+def test_pressing_enter_at_the_port_question_leaves_it_unset() -> None:
+    answers = Answers("")
+
+    settings = resolve_section_settings(
+        _sqlserver_section(), ["source"], prompter=answers.prompter()
+    )
+
+    assert len(answers.asked) == 1
+    assert settings["source"].port is None
+
+
+def test_a_typed_sql_server_port_is_kept() -> None:
+    answers = Answers("14330")
+
+    settings = resolve_section_settings(
+        _sqlserver_section(), ["source"], prompter=answers.prompter()
+    )
+
+    assert settings["source"].port == 14330
+
+
+def test_oracle_still_takes_its_default_port_because_it_has_no_discovery() -> None:
+    profile = parse_profile(
+        {
+            "version": "1.0",
+            "source": {
+                "type": "oracle",
+                "server": "legacy-ora",
+                "database": "LEGACYPAY",
+                "username": "recon_reader",
+            },
+        },
+        source="<test>",
+    )
+    answers = Answers("", "s3cret")
+
+    settings = resolve_section_settings(profile, ["source"], prompter=answers.prompter())
+
+    assert settings["source"].port == 1521

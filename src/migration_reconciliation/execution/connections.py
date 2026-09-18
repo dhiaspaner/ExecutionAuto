@@ -86,8 +86,16 @@ def _settings_for(
     server = _answer(
         ask, supplied.server, f"{label} server (hostname or IP)", f"[{name}] server", interactive
     )
+    # A SQL Server port that nobody supplied stays unset: leaving it out of the
+    # connection string is what lets the driver ask the SQL Browser service for
+    # a named instance's port. Assuming 1433 would be right only for a default,
+    # unnamed instance and would break every named one.
     port = supplied.port
-    if port is None:
+    if port is not None:
+        if interactive:
+            ask.supplied(f"{label} port", port)
+    elif engine is DatabaseType.ORACLE:
+        # Oracle has no such discovery, and its descriptor always names a port.
         default = default_port_for(engine)
         port = (
             ask.port(f"{label} port", default)
@@ -95,7 +103,7 @@ def _settings_for(
             else default  # a default port is not a secret and needs no question
         )
     elif interactive:
-        ask.supplied(f"{label} port", port)
+        port = ask.optional_port(f"{label} port")
 
     database_question = (
         f"{label} service name" if engine is DatabaseType.ORACLE else f"{label} database name"

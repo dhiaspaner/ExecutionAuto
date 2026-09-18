@@ -63,7 +63,7 @@ def sqlserver_answers(**overrides: Any) -> list[str]:
         "2",  # sheet, by number
         "sqlserver",  # source type
         "sql-legacy.internal",  # source server
-        "",  # source port, Enter for the default
+        "",  # source port, Enter leaves it for the driver to detect
         "LegacyDb",  # source database
         "y",  # trust the source certificate
         "password",  # source authentication
@@ -113,7 +113,7 @@ def test_all_fifteen_answers_are_collected(workbook: Path, sheets_of: Any) -> No
     assert result.sheet_name == "Payments"
     assert result.source.database_type is DatabaseType.SQLSERVER
     assert result.source.server == "sql-legacy.internal"
-    assert result.source.port == 1433
+    assert result.source.port is None  # Enter left it unset; the driver resolves it
     assert result.source.database == "LegacyDb"
     assert result.source.trust_server_certificate is True
     assert result.source.username == "legacy_reader"
@@ -183,7 +183,9 @@ def test_an_oracle_source_asks_for_a_service_name_and_skips_the_certificate_ques
     assert result.source.port == 1521
     assert result.source.database == "LEGACYSVC"
     assert result.source.trust_server_certificate is False
-    assert result.target.port == 1433
+    # Enter means 1521 for Oracle, which has no port discovery, but leaves the
+    # SQL Server target without one so the driver can discover it.
+    assert result.target.port is None
     assert "Source service name" in console.transcript
     assert "Trust the source server's certificate" not in console.transcript
     assert "Source authentication" not in console.transcript
@@ -455,9 +457,7 @@ def test_windows_authentication_describes_itself_without_a_username(
 
     result = drive(console, sheets_of)
 
-    assert result.source.describe() == (
-        "sql-legacy.internal:1433/LegacyDb using Windows authentication"
-    )
+    assert result.source.describe() == ("sql-legacy.internal/LegacyDb using Windows authentication")
 
 
 def test_oracle_cannot_use_windows_authentication() -> None:

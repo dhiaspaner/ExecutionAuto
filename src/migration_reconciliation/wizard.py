@@ -146,11 +146,25 @@ class Prompter:
 
     def port(self, question: str, default: int) -> int:
         """A TCP port. Pressing Enter accepts ``default``."""
-        label = self._label(f"{question} [{default}]")
+        answer = self._read_port(question, hint=str(default))
+        return default if answer is None else answer
+
+    def optional_port(self, question: str) -> int | None:
+        """A TCP port, or nothing at all.
+
+        Pressing Enter leaves the port unset, which is the right answer for a
+        named SQL Server instance: the driver then asks the SQL Browser service
+        which port that instance is listening on today.
+        """
+        return self._read_port(question, hint="leave empty to detect it")
+
+    def _read_port(self, question: str, *, hint: str) -> int | None:
+        """A TCP port, or ``None`` when the answer is left empty."""
+        label = self._label(f"{question} [{hint}]")
         while True:
             answer = self._read(label).strip()
             if not answer:
-                return default
+                return None
             try:
                 port = int(answer)
             except ValueError:
@@ -398,11 +412,17 @@ def _server(ask: Prompter, profile: ConnectionProfile, question: str) -> str:
 
 def _port(
     ask: Prompter, profile: ConnectionProfile, question: str, database_type: DatabaseType
-) -> int:
+) -> int | None:
     if profile.port is not None:
         ask.supplied(question, profile.port)
         return profile.port
-    return ask.port(question, default_port_for(database_type))
+    if database_type is DatabaseType.ORACLE:
+        # Oracle's EasyConnect descriptor always names a port and Oracle has no
+        # equivalent of the SQL Browser, so an unanswered question takes 1521.
+        return ask.port(question, default_port_for(database_type))
+    # SQL Server may be left without one, so the driver can discover a named
+    # instance's dynamic port for itself.
+    return ask.optional_port(question)
 
 
 def _database(ask: Prompter, profile: ConnectionProfile, question: str) -> str:

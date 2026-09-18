@@ -105,6 +105,16 @@ trust_server_certificate = true
 authentication = "windows"
 ```
 
+`port` is the one key with a second meaning when it is absent. A SQL Server
+connection with no port — the key left out, or set to `""` — puts no port in the
+connection string at all, so the ODBC driver resolves one itself: for a named
+instance such as `server = "HOST\\SQLEXPRESS"` it asks the SQL Server Browser
+service over UDP 1434 which port that instance is listening on. That lookup is
+the only way to reach an instance on a dynamic port, and naming an explicit port
+disables it, so nothing is assumed on your behalf — 1433 is correct only for a
+default, unnamed instance. Oracle keeps its 1521 default, because EasyConnect
+always names a port and Oracle has no equivalent discovery service.
+
 Every key is optional: what is missing is asked for, one question at a time, and
 what is present is echoed on screen so you can see what the run assumed. A
 `[workbook] path` that no longer exists is a warning and a question, not a
@@ -589,14 +599,14 @@ One at a time, in this order, each re-asked until it is valid:
 | 2 | Which sheet | Sheets are listed and numbered; answer by number or name. |
 | 3 | Source database type | `sqlserver` or `oracle`. |
 | 4 | Source server | Hostname or IP. |
-| 5 | Source port | Enter accepts 1433, or 1521 for Oracle. |
+| 5 | Source port | Enter leaves it unset for SQL Server, so the driver detects it; for Oracle, Enter accepts 1521. |
 | 6 | Source database or service name | Service name when the source is Oracle. |
 | 7 | Trust the source certificate? | SQL Server only. |
 | 8 | Source authentication | `windows` or `password`. SQL Server only; Oracle always uses a password. |
 | 9 | Source username | Skipped under Windows authentication. |
 | 10 | Source password | Hidden. Skipped under Windows authentication. |
 | 11 | Target server | The target is always SQL Server. |
-| 12 | Target port | Enter accepts 1433. |
+| 12 | Target port | Enter leaves it unset, so the driver detects the port — the right answer for a named instance. |
 | 13 | Target database name | |
 | 14 | Trust the target certificate? | |
 | 15 | Target authentication | `windows` or `password`. |
@@ -656,14 +666,14 @@ schema = "config/workbook_schema.default.toml"   # optional; see 3c below
 [source]
 type = "oracle"                  # "oracle" or "sqlserver"
 server = "legacy-ora.corp.local"
-port = 1521                      # omit to accept the default for the type
+port = 1521                      # Oracle: omit to accept 1521
 database = "LEGACYPAY"           # the SERVICE NAME when type = "oracle"
 authentication = "password"
 username = "recon_reader"
 
 [target]                         # always SQL Server, so there is no `type` key
 server = "sql-mig-01.corp.local"
-port = 1433
+port = 1433                      # SQL Server: omit for a named instance
 database = "PaymentsMigrated"
 trust_server_certificate = true
 authentication = "windows"       # needs no username and no password

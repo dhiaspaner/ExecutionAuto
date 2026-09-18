@@ -320,6 +320,10 @@ _CONNECTIONS_SHEET: tuple[str, ...] = (
     "trust_server_certificate = true",
     'authentication = "windows"',
     "",
+    "Leave port out (or empty) when server names an instance, for example",
+    'server = "HOST\\\\SQLEXPRESS": the driver then asks the SQL Browser service',
+    "which port that instance is on, which a fixed port would prevent.",
+    "",
     "A password key is rejected, not ignored. Under password authentication the",
     "username lives in TOML and the password is typed at runtime, hidden.",
 )

@@ -91,7 +91,7 @@ class SqlServerExecutor:
         return ConnectionIdentity(
             connection_name=self._settings.connection_name,
             database_type=self._settings.database_type,
-            server_description=f"{self._settings.server}:{self._settings.port}",
+            server_description=self._settings.server_address,
             database_name=self._settings.database,
             account_name=self._account_name(),
             product_version=self._product_version(),
@@ -218,9 +218,17 @@ class SqlServerExecutor:
         is told about a failure comes from :mod:`.failures` instead.
         """
         settings = self._settings
+        # SERVER carries a port only when the profile gave one. Left off, the
+        # ODBC driver resolves the port itself: for a named instance
+        # (HOST\INSTANCE) it asks the SQL Server Browser service over UDP 1434,
+        # which is the only way to reach an instance listening on a dynamic
+        # port that moves between restarts. Naming an explicit port alongside
+        # an instance name disables that lookup, so no port is assumed here —
+        # 1433 is right only for a default, unnamed instance.
+        server = settings.server if settings.port is None else f"{settings.server},{settings.port}"
         parts = [
             f"DRIVER={{{self._choose_driver(module)}}}",
-            f"SERVER={settings.server},{settings.port}",
+            f"SERVER={server}",
             f"DATABASE={settings.database}",
         ]
         if settings.uses_windows_authentication:

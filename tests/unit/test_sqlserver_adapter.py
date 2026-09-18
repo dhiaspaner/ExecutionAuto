@@ -50,6 +50,29 @@ def test_connect_builds_a_connection_string_from_the_answers() -> None:
     assert "Encrypt=yes" in connection_string
 
 
+def test_no_port_leaves_the_server_bare_for_sql_browser_discovery() -> None:
+    driver = FakePyodbc()
+    executor = SqlServerExecutor(settings(server="HOST\\SQLEXPRESS", port=None), driver=driver)
+
+    executor.connect()
+
+    assert driver.connection is not None
+    connection_string = driver.connection.connection_string
+    # No port at all, not 1433: an explicit port next to an instance name stops
+    # the driver asking the SQL Browser which port the instance is on.
+    assert "SERVER=HOST\\SQLEXPRESS;" in connection_string
+    assert "1433" not in connection_string
+
+
+def test_a_missing_port_is_left_out_of_the_reported_server() -> None:
+    driver = FakePyodbc()
+    executor = SqlServerExecutor(settings(server="HOST\\SQLEXPRESS", port=None), driver=driver)
+
+    identity = executor.test_connection()
+
+    assert identity.server_description == "HOST\\SQLEXPRESS"
+
+
 def test_certificate_validation_stays_on_unless_asked() -> None:
     driver = FakePyodbc()
     SqlServerExecutor(settings(trust_server_certificate=False), driver=driver).connect()
@@ -242,6 +265,24 @@ def test_connection_failures_name_a_likely_cause(state: str, expected: str) -> N
 
     with pytest.raises(DatabaseExecutionError, match=expected):
         executor.connect()
+
+
+def test_an_unreachable_server_with_no_port_points_at_the_sql_browser() -> None:
+    driver = FakePyodbc(connect_error=odbc_error("08001", "driver detail here"))
+    executor = SqlServerExecutor(settings(server="HOST\\SQLEXPRESS", port=None), driver=driver)
+
+    with pytest.raises(DatabaseExecutionError, match="SQL Server Browser service"):
+        executor.connect()
+
+
+def test_the_sql_browser_hint_is_left_out_when_a_port_was_configured() -> None:
+    driver = FakePyodbc(connect_error=odbc_error("08001", "driver detail here"))
+    executor = SqlServerExecutor(settings(), driver=driver)
+
+    with pytest.raises(DatabaseExecutionError) as caught:
+        executor.connect()
+
+    assert "SQL Server Browser" not in str(caught.value)
 
 
 def test_a_connection_failure_never_echoes_the_password() -> None:

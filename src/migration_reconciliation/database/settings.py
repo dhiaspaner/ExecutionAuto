@@ -70,7 +70,11 @@ class ConnectionSettings:
     side: QuerySide
     database_type: DatabaseType
     server: str
-    port: int
+    #: ``None`` means no port is placed in the connection string at all, so the
+    #: driver resolves one itself. For SQL Server that is how a named instance
+    #: on a dynamic port is reached — see
+    #: :meth:`.SqlServerExecutor._build_connection_string`.
+    port: int | None
     #: SQL Server database name, or the Oracle service name.
     database: str
     #: Empty under Windows authentication: the signed-in account is used.
@@ -108,6 +112,13 @@ class ConnectionSettings:
             raise ReconciliationError(
                 f"The {self.side.value} connection needs a username and a password."
             )
+
+    @property
+    def server_address(self) -> str:
+        """``host:port`` for messages, or the host alone when no port is set."""
+        if self.port is None:
+            return self.server
+        return f"{self.server}:{self.port}"
 
     @property
     def uses_windows_authentication(self) -> bool:
@@ -157,4 +168,4 @@ class ConnectionSettings:
             if self.uses_windows_authentication
             else f"as {self.username}"
         )
-        return f"{self.server}:{self.port}/{self.database} {who}"
+        return f"{self.server_address}/{self.database} {who}"

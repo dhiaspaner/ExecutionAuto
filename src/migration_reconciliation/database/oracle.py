@@ -47,7 +47,7 @@ from .failures import (
     connection_failure_message,
     is_timeout_failure,
 )
-from .settings import ConnectionSettings
+from .settings import ConnectionSettings, default_port_for
 
 __all__ = ["OracleExecutor"]
 
@@ -86,7 +86,13 @@ class OracleExecutor:
     def dsn(self) -> str:
         """EasyConnect descriptor. Carries the service name, never a password."""
         settings = self._settings
-        return f"{settings.server}:{settings.port}/{settings.database}"
+        # EasyConnect has no equivalent of the SQL Browser lookup, so an Oracle
+        # connection always names a port; the resolvers fill in 1521 when the
+        # profile leaves it out.
+        port = settings.port
+        if port is None:
+            port = default_port_for(settings.database_type)
+        return f"{settings.server}:{port}/{settings.database}"
 
     def test_connection(self) -> ConnectionIdentity:
         """Confirm the connection works and describe it without secrets."""
@@ -94,7 +100,7 @@ class OracleExecutor:
         return ConnectionIdentity(
             connection_name=self._settings.connection_name,
             database_type=self._settings.database_type,
-            server_description=f"{self._settings.server}:{self._settings.port}",
+            server_description=self._settings.server_address,
             database_name=self._settings.database,
             account_name=self._settings.username,
             product_version=self._product_version(),

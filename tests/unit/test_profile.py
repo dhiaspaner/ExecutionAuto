@@ -271,6 +271,15 @@ def test_an_invalid_port_is_rejected(port: Any) -> None:
         parse_profile(bad)
 
 
+@pytest.mark.parametrize("port", ["", "   "])
+def test_an_empty_port_means_the_key_was_not_given(port: str) -> None:
+    """TOML has no null, so an empty port is how a file says "leave it unset"."""
+    document_with_blank_port = document()
+    document_with_blank_port["source"]["port"] = port
+
+    assert parse_profile(document_with_blank_port).source.port is None
+
+
 def test_an_empty_string_is_rejected() -> None:
     bad = document()
     bad["source"]["server"] = "   "

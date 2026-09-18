@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+from ..models import DatabaseType
 from ..security.redaction import sanitize_error
 from .settings import ConnectionSettings
 
@@ -121,7 +122,26 @@ def connection_failure_message(exc: BaseException, settings: ConnectionSettings)
     detail = sanitize_error(exc, max_length=160)
     return (
         f"Cannot connect to the {settings.side.value} database "
-        f"({settings.describe()}): {_ADVICE[cause]}. Driver reported: {detail}"
+        f"({settings.describe()}): {_ADVICE[cause]}{_port_hint(cause, settings)}. "
+        f"Driver reported: {detail}"
+    )
+
+
+def _port_hint(cause: FailureCause, settings: ConnectionSettings) -> str:
+    """The extra thing to check when no port was configured.
+
+    Without a port the driver finds one by asking the SQL Server Browser
+    service, so an unreachable server has one more possible cause than the
+    hostname and the firewall — and it is the one nobody thinks of.
+    """
+    if cause is not FailureCause.NETWORK or settings.port is not None:
+        return ""
+    if settings.database_type is not DatabaseType.SQLSERVER:
+        return ""
+    return (
+        ". No port is configured, so the port is being looked up through the "
+        "SQL Server Browser service: check that it is running and that UDP 1434 "
+        "is allowed, or set a port in the profile"
     )
 
 
